@@ -159,7 +159,7 @@ class TestEnvironmentDiscovery:
         from gbserver.environment import Environment
 
         try:
-            import aiohttp  # noqa: F401
+            import kubernetes_asyncio  # noqa: F401
 
             assert "K8s" in Environment.environment_types
             assert "k8s" in Environment.environment_types

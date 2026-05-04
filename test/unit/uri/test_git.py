@@ -5,6 +5,8 @@ from gbcommon.uri.git import GitURI
 from gbserver.types.constants import SPACE_REPO_CONFIG_BRANCH_NAME
 from gbserver.types.constants_base import DEFAULT_GH_DOMAIN
 
+pytestmark = pytest.mark.ibm
+
 
 def test_space_config_uris():
     check_test_config()

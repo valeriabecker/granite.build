@@ -15,9 +15,7 @@ import pytest
 
 from gbserver.messaging.messaging_base import Address
 
-pytestmark = pytest.mark.ibm
-
-pytestmark = pytest.mark.nats_server
+pytestmark = [pytest.mark.ibm, pytest.mark.nats_server]
 
 
 def _unique_queue():
