@@ -928,13 +928,16 @@ def pagination_range(total_items: int, page_index: int, page_size: int):
     return start, end
 
 
-def render_plain(rows, headers):
+def render_plain(rows: list, headers: list) -> str:
     """Borderless, pipe-friendly table using tabulate with plain formatting."""
     return tabulate(rows, headers, tablefmt="plain")
 
 
-def render_pretty(rows, headers, title="", fold_columns=None):
+def render_pretty(
+    rows: list, headers: list, title: str = "", fold_columns: list | None = None
+) -> None:
     """Bordered rich.Table for human-readable output. fold_columns: list of header names to render with width=25 and overflow='fold'."""
+    from rich.console import Console
     from rich.table import Table
 
     fold_columns = fold_columns or []
