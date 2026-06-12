@@ -1466,6 +1466,16 @@ def _lineage_lh(ctx, artifact_client, artifact, format, quiet, echo_callback):
                 webbrowser.open(artifact_lineage_url)
 
 
+def _show_no_lineage_message(artifact):
+    certified_no_restrictions = artifact.get("certified_no_restrictions", False)
+    if certified_no_restrictions:
+        click.echo(
+            "\nℹ️  This artifact was registered with --certify-no-restrictions and has no origin lineage data."
+        )
+    else:
+        click.echo("\nℹ️  No lineage found for this artifact.")
+
+
 def _lineage_hf(ctx, artifact_client, artifact, format, quiet):
     artifact_uri = artifact["uri"]
 
@@ -1478,9 +1488,13 @@ def _lineage_hf(ctx, artifact_client, artifact, format, quiet):
         else execute_with_spinner(artifact_client.artifact_lineage_hf, artifact_uri)
     )
 
+    if response is None:
+        _show_no_lineage_message(artifact)
+        return
+
     runs = response.get("runs", [])
     if len(runs) == 0:
-        click.echo("\nNo lineage found.")
+        _show_no_lineage_message(artifact)
         return
 
     if format == "json":
@@ -1597,6 +1611,7 @@ def lineage(ctx, artifact_id: str, format: str, skip_version_check: bool, quiet:
         else:
             pass  # Ignore unknown events
 
+    artifact = None
     try:
         id_format = parse_artifact_identifier(artifact_id)
         if id_format in ["uuid", "uri"]:
@@ -1641,9 +1656,17 @@ def lineage(ctx, artifact_id: str, format: str, skip_version_check: bool, quiet:
         click.echo(f"❌ {str(e)}", err=True)
         ctx.exit(1)  # Exit with a non-zero status
     except Exception as e:
-        click.echo(f"\n{str_exc_chain(e)}", err=True)
-        click.echo(f"❌ Artifact lineage failed!", err=True)
-        ctx.exit(1)  # Exit with a non-zero status
+        from fastapi import HTTPException
+
+        if isinstance(e, HTTPException) and e.status_code == 404:
+            if artifact:
+                _show_no_lineage_message(artifact)
+            else:
+                click.echo("\nℹ️  No lineage found for this artifact.")
+        else:
+            click.echo(f"\n{str_exc_chain(e)}", err=True)
+            click.echo(f"❌ Artifact lineage failed!", err=True)
+            ctx.exit(1)  # Exit with a non-zero status
 
 
 @cli.command()
