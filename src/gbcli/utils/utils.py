@@ -929,14 +929,22 @@ def pagination_range(total_items: int, page_index: int, page_size: int):
 
 
 def render_plain(rows: list, headers: list) -> str:
-    """Borderless, pipe-friendly table using tabulate with plain formatting."""
+    """Borderless, pipe-friendly table using tabulate with plain formatting.
+
+    Note the asymmetry with render_pretty: this returns the rendered string,
+    which the caller is responsible for emitting (e.g. via click.echo).
+    """
     return tabulate(rows, headers, tablefmt="plain")
 
 
 def render_pretty(
     rows: list, headers: list, title: str = "", fold_columns: list | None = None
 ) -> None:
-    """Bordered rich.Table for human-readable output. fold_columns: list of header names to render with width=25 and overflow='fold'."""
+    """Bordered rich.Table for human-readable output. fold_columns: list of header names to render with width=25 and overflow='fold'.
+
+    Note the asymmetry with render_plain: this prints directly to a Console()
+    and returns None, so it must NOT be wrapped in click.echo(...).
+    """
     from rich.console import Console
     from rich.table import Table
 

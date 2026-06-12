@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict
 
 import click
+from fastapi import HTTPException
 from tqdm import tqdm
 
 from gbcli.client.client import GBClient
@@ -1395,7 +1396,7 @@ def _lineage_lh(ctx, artifact_client, artifact, format, quiet, echo_callback):
     )
 
     if len(lineage_dict) == 0:
-        click.echo("\nNo lineage found.")
+        _show_no_lineage_message(artifact)
         return
 
     if format == "json":
@@ -1656,8 +1657,6 @@ def lineage(ctx, artifact_id: str, format: str, skip_version_check: bool, quiet:
         click.echo(f"❌ {str(e)}", err=True)
         ctx.exit(1)  # Exit with a non-zero status
     except Exception as e:
-        from fastapi import HTTPException
-
         if isinstance(e, HTTPException) and e.status_code == 404:
             if artifact:
                 _show_no_lineage_message(artifact)
