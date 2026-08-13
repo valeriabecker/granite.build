@@ -76,16 +76,39 @@ class TargetJobStatsResponse(BaseModel):
     jobstats: dict[str, list[Any]]
 
 
+class ExpandableNode(BaseModel):
+    build_id: str
+    target_id: str
+    direction: str
+
+
 class BuildJobStatsResponse(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     build_id: str
     targets: list[dict[str, list[Any]]]
+    truncated: bool = False
+    expandable: list[ExpandableNode] = []
+
+
+_VALID_DIRECTIONS = ("upstream", "downstream", "both")
 
 
 @lineage_api.get("/build/{build_id}")
-def get_build_jobstats(request: Request, build_id: str) -> BuildJobStatsResponse:
-    """Get JobStats for all targets in a build."""
+def get_build_jobstats(
+    request: Request,
+    build_id: str,
+    direction: Optional[str] = None,
+    max_depth: int = 10,
+) -> BuildJobStatsResponse:
+    """Get JobStats for all targets in a build.
+
+    If `direction` is omitted, behavior is unchanged: only this build's own
+    targets are returned. If `direction` is "upstream", "downstream", or
+    "both", the response also includes cross-build lineage reached by
+    traversing shared artifact UUIDs, up to `max_depth` hops (-1 for "full
+    map", bounded internally by a safety cap).
+    """
     storage = get_admin_storage()
 
     from gbserver.lineage.jobstats import get_lineage_store
@@ -100,12 +123,34 @@ def get_build_jobstats(request: Request, build_id: str) -> BuildJobStatsResponse
     assert isinstance(build, StoredBuild)
     authorize_build_read_access(request, build)
 
+    jobstats_storage = get_lineage_store()
+
+    if direction is not None:
+        if direction not in _VALID_DIRECTIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"direction must be one of {_VALID_DIRECTIONS}",
+            )
+        if max_depth != -1 and not (1 <= max_depth <= 50):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="max_depth must be -1 or between 1 and 50",
+            )
+        graph = jobstats_storage.get_lineage_graph(
+            storage, build_id, direction, max_depth
+        )
+        return BuildJobStatsResponse(
+            build_id=build_id,
+            targets=graph["targets"],
+            truncated=graph["truncated"],
+            expandable=[ExpandableNode(**e) for e in graph["expandable"]],
+        )
+
     # Get all targets for this build
     row_filter = {"build_id": build_id}
     targets = storage.target_storage.get_by_where(row_filter)
 
     # Collect JobStats for each target
-    jobstats_storage = get_lineage_store()
     target_responses: list[dict[str, list[Any]]] = []
 
     for target in targets:
@@ -375,7 +420,7 @@ def get_artifact_graph(request: Request, body: ArtifactGraphRequest):
             job_output_stats=metadata.get("job_output_stats") or {},
         )
         # job_namespace is written as f"{space_name}/{build_name}" (see
-        # wandb_jobstats._build_events_for_target); split on the first "/"
+        # jobstats_builder.build_events_for_target); split on the first "/"
         # to recover the space and drop runs from spaces the caller can't
         # access. Runs missing both an owner and a namespace fail closed.
         run_space_name = entry.job_namespace.split("/", 1)[0]

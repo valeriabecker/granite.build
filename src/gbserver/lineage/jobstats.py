@@ -81,6 +81,23 @@ class ILineageStore(ABC):
         self, release_id: str, expected_count: int, target_id: Optional[str] = None
     ) -> bool: ...
 
+    @abstractmethod
+    def get_lineage_graph(
+        self,
+        storage: SingletonAdminStorage,
+        build_id: str,
+        direction: str = "both",
+        max_depth: int = 10,
+    ) -> dict:
+        """Traverse cross-build lineage from build_id's target-runs via shared artifact UUIDs.
+
+        Returns {"root_build_id", "targets": [<jobstats dict per visited run>],
+        "truncated": bool, "expandable": [{"build_id", "target_id", "direction"}]}.
+        direction is "upstream", "downstream", or "both". max_depth is 1..50, or
+        -1 for "full map" (bounded internally by a safety cap on visited runs).
+        """
+        ...
+
 
 __JOBSTATS_STORAGE: Optional[ILineageStore] = None
 

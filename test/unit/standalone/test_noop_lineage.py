@@ -101,9 +101,21 @@ class TestNoopLineageStoreReturnValues:
         result = store.add_jobstats_for_original_artifact(artifact=None, sources=[])
         assert result is None
 
-    def test_create_jobstats_for_target(self, store):
+    def test_create_jobstats_for_target_missing_build_returns_empty(self, store):
+        from gbserver.storage.stored_target_run import StoredTargetRun
+
+        class _FakeBuildStorage:
+            def get_by_uuid(self, uuid):
+                return None
+
+        class _FakeStorage:
+            build_storage = _FakeBuildStorage()
+
+        targetrun = StoredTargetRun(
+            uuid="target-1", build_id="missing-build", environment_uri="local://x"
+        )
         events, events_dict = store.create_jobstats_for_target(
-            storage=None, targetrun=None
+            storage=_FakeStorage(), targetrun=targetrun
         )
         assert events == []
         assert events_dict == {}

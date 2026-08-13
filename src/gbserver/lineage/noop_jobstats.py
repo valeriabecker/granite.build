@@ -19,6 +19,10 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 from gbserver.lineage.jobstats import ILineageStore
+from gbserver.lineage.jobstats_builder import (
+    build_events_for_target,
+    traverse_lineage_graph,
+)
 from gbserver.storage.artifact_registration import ArtifactRegistration
 from gbserver.storage.singleton_storage import SingletonAdminStorage
 from gbserver.storage.stored_build import StoredBuild
@@ -60,12 +64,40 @@ class NoopLineageStore(ILineageStore):
         targetrun: StoredTargetRun,
         build: Optional[StoredBuild] = None,
     ) -> Tuple:
-        return [], {}
+        if build is None:
+            build_result = storage.build_storage.get_by_uuid(targetrun.build_id)
+            if build_result is None:
+                return [], {}
+            assert isinstance(build_result, StoredBuild)
+            build = build_result
+
+        if targetrun.skipped_for_prerun_target_id:
+            original = storage.target_storage.get_by_uuid(
+                targetrun.skipped_for_prerun_target_id
+            )
+            if original is not None and isinstance(original, StoredTargetRun):
+                targetrun = original.model_copy(
+                    update={
+                        "uuid": targetrun.uuid,
+                        "build_id": targetrun.build_id,
+                    }
+                )
+
+        return build_events_for_target(storage, build, targetrun)
 
     def create_jobstats_for_original_artifact(
         self, artifact: ArtifactRegistration, sources: list[ArtifactRegistration]
     ):
         return {}
+
+    def get_lineage_graph(
+        self,
+        storage: SingletonAdminStorage,
+        build_id: str,
+        direction: str = "both",
+        max_depth: int = 10,
+    ) -> dict:
+        return traverse_lineage_graph(storage, build_id, direction, max_depth)
 
     def count_release_ids(
         self, release_id: str, target_id: Optional[str] = None

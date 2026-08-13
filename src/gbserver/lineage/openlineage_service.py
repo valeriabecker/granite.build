@@ -51,6 +51,7 @@ class LineageService(ABC):
         artifact_type: Optional[str] = None,
         max_depth: int = 10,
         direction: str = "downstream",
+        build_id: Optional[str] = None,
     ) -> Optional[Dict]:
         pass
 
@@ -82,6 +83,7 @@ class NoopLineageService(LineageService):
         artifact_type: Optional[str] = None,
         max_depth: int = 10,
         direction: str = "downstream",
+        build_id: Optional[str] = None,
     ) -> Optional[Dict]:
         return None
 
@@ -93,6 +95,10 @@ class LineageServiceFactory:
     def create(service_type: str) -> LineageService:
         if service_type == "none":
             return NoopLineageService()
+        if service_type == "db":
+            from gbserver.lineage.db_service import DbLineageService
+
+            return DbLineageService()
         if not LineageServiceFactory._registry:
             from gbserver.lineage.wandb_service import WandBLineageService
 

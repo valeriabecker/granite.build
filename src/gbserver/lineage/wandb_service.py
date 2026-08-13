@@ -31,7 +31,7 @@ from gbserver.lineage.openlineage_utils import (
     parse_hf_uri,
     parse_hf_url,
 )
-from gbserver.lineage.wandb_jobstats import LINEAGE_PRODUCER_URL
+from gbserver.lineage.jobstats_builder import LINEAGE_PRODUCER_URL
 from gbserver.types.constants import (
     GBSERVER_WANDB_API_KEY,
     GBSERVER_WANDB_BASE_URL,
@@ -476,6 +476,7 @@ class WandBLineageService(LineageService):
         artifact_type: Optional[str] = None,
         max_depth: int = 10,
         direction: str = "downstream",
+        build_id: Optional[str] = None,
     ) -> Optional[Dict]:
         try:
             api = wandb.Api()
