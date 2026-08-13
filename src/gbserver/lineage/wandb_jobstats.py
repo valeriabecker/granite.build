@@ -82,6 +82,18 @@ class WandBLineageStore(ILineageStore):
         targetrun: StoredTargetRun,
     ) -> None:
         events, _ = self.create_jobstats_for_target(storage, targetrun, build)
+        if not events:
+            # No events means emit_event is never called, yet the caller
+            # (reconciler) will still mark the target recorded — a silent no-op
+            # that leaves nothing in the backend. Surface it rather than hide it.
+            logger.warning(
+                "No lineage events built for target %s (name=%s) in build %s; "
+                "nothing emitted to the lineage backend",
+                targetrun.uuid,
+                targetrun.name,
+                build.uuid,
+            )
+            return
         for event in events:
             self._service.emit_event(event)
 
@@ -168,6 +180,18 @@ class WandBLineageStore(ILineageStore):
     ) -> bool:
         count = self.count_release_ids(release_id, target_id)
         return count == expected_count
+
+    def filter_unrecorded(
+        self,
+        target_ids: set[str],
+        expected_counts: Optional[dict[str, int]] = None,
+    ) -> set[str]:
+        # Delegate to the service, which checks the candidates against wandb run
+        # metadata. ``expected_counts`` lets it require a *full* set of runs per
+        # target rather than mere presence (see ILineageStore.filter_unrecorded).
+        # Never raises: returns the candidates unchanged on failure so the caller
+        # re-records them (a harmless idempotent no-op).
+        return self._service.filter_unrecorded(target_ids, expected_counts)
 
     def _build_event_for_artifact(
         self,
