@@ -483,3 +483,82 @@ export async function getArtifactLineage(params: GetArtifactLineageParams): Prom
   const { data } = await client.post<ArtifactLineageResult>('/lineage/artifact', params, { timeout: 45_000 })
   return data
 }
+
+// ── Build (cross-build) lineage ───────────────────────────────────────────────
+//
+// GET /lineage/build/{id}?direction=…&max_depth=N walks lineage across builds by
+// following shared artifact UUIDs. The response is JobStats: one dict per visited
+// target-run, keyed by output-artifact name, holding OpenLineage-shaped events.
+// Facets are typed loosely on purpose — the backend merges the whole artifact
+// model into them (see jobstats_builder._artifact_to_lineage_entry).
+
+export type LineageDirection = 'upstream' | 'downstream' | 'both'
+
+export interface JobStatsArtifactEntry {
+  namespace?: string
+  name?: string
+  facets?: {
+    artifact_id?: string
+    artifact_uri?: string
+    /** ArtifactType enum NAME: MODEL | DATASET | FILESET | TABLE | … */
+    artifact_type?: string
+    [k: string]: unknown
+  }
+}
+
+export interface JobStatsEvent {
+  run?: {
+    /** target uuid, or `${target_uuid}-${output_uuid}` for per-output events. */
+    runId?: string
+    facets?: {
+      tags?: { build_id?: string; target_id?: string; space_name?: string }
+      job_details?: {
+        /** The logical target uuid, even when runId carries an output suffix. */
+        job_id?: string
+        job_status?: string
+        release_id?: string
+        [k: string]: unknown
+      }
+    }
+  }
+  job?: { namespace?: string; name?: string }
+  inputs?: JobStatsArtifactEntry[]
+  outputs?: JobStatsArtifactEntry[]
+  /** Mirror of `inputs` — ignore it, or inputs get counted twice. */
+  sources?: JobStatsArtifactEntry[]
+}
+
+/** One visited target-run: { <output artifact name | "no-output">: events[] }. */
+export type TargetJobStats = Record<string, JobStatsEvent[]>
+
+export interface LineageExpandableNode {
+  build_id: string
+  target_id: string
+  direction: LineageDirection
+}
+
+export interface BuildLineageResult {
+  build_id: string
+  targets: TargetJobStats[]
+  truncated: boolean
+  expandable: LineageExpandableNode[]
+}
+
+export async function getBuildLineage(
+  buildId: string,
+  direction: LineageDirection,
+  maxDepth: number,
+): Promise<BuildLineageResult> {
+  const { data } = await client.get<BuildLineageResult>(`/lineage/build/${buildId}`, {
+    params: { direction, max_depth: maxDepth },
+    // The traversal scans every target-run it reaches, so allow the same
+    // generous budget as the artifact lineage endpoint.
+    timeout: 45_000,
+  })
+  return {
+    build_id: data.build_id,
+    targets: data.targets ?? [],
+    truncated: Boolean(data.truncated),
+    expandable: data.expandable ?? [],
+  }
+}

@@ -76,6 +76,7 @@ export default function GraphNode({ node, onClick, onMouseHover, selectedNode }:
     isSelected ? styles.nodeWrapperSelected : '',
     isHighlighted ? styles.nodeWrapperHighlighted : '',
     node.planned ? styles.nodeWrapperPlanned : '',
+    node.foreignBuild ? styles.nodeWrapperForeign : '',
   ].filter(Boolean).join(' ')
 
   return (
@@ -112,11 +113,11 @@ export default function GraphNode({ node, onClick, onMouseHover, selectedNode }:
             >
               {title}
             </CardNodeTitle>
-            {subtitleLabel && (
+            {(node.subtitle || subtitleLabel) && (
               <CardNodeSubtitle
                 style={{ fontSize: '0.75rem', color: 'var(--cds-text-secondary)' }}
               >
-                {subtitleLabel}
+                {node.subtitle || subtitleLabel}
               </CardNodeSubtitle>
             )}
           </CardNodeColumn>

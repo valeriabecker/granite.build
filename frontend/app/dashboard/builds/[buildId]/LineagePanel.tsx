@@ -18,9 +18,14 @@ import { parse as parseYaml } from 'yaml'
 import { useQuery, useQueries } from '@tanstack/react-query'
 import type { Build, BuildStatusDetail } from '@/types'
 import { getArtifact } from '@/api/gbserver'
-import { getBuildArchiveFiles } from '@/api/gbserver'
+import { getBuildArchiveFiles, getBuildLineage, type LineageDirection } from '@/api/gbserver'
 import Graph, { type ElkNodeEx, type GraphHandle, type NodeType } from '@/components/LineageGraph/Graph'
-import { getSubgraph } from '@/components/LineageGraph/diagramUtilities'
+import {
+  artifactTypeToNodeType,
+  jobstatsToGraph,
+  mergeGraphs,
+  renameNodes,
+} from '@/components/LineageGraph/jobstatsGraph'
 
 const ACTIVE_STATUSES = new Set(['running', 'submitted', 'pending'])
 
@@ -61,15 +66,6 @@ interface LineagePanelProps {
   statusError?: Error | null
   showFocusNode?: boolean
   initialFocusNodeId?: string
-}
-
-function artifactTypeToNodeType(artifactType: string): NodeType {
-  switch (artifactType.toUpperCase()) {
-    case 'MODEL': return 'Model'
-    case 'DATASET': return 'Dataset'
-    case 'FILESET': return 'Fileset'
-    default: return 'Fileset'
-  }
 }
 
 function buildGraphData(
@@ -261,9 +257,66 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
     return yaml ? parseDefinitionTargets(yaml) : []
   }, [archiveFiles])
 
-  const { nodes: allNodes, links: allLinks, artifactIds } = React.useMemo(
+  const baseGraph = React.useMemo(
     () => buildGraphData(buildStatus, plannedTargets, isActive),
     [buildStatus, plannedTargets, isActive]
+  )
+
+  // ── Cross-build lineage expansion ───────────────────────────────────────────
+  // The Upstream/Downstream buttons deepen a traversal that follows shared
+  // artifact UUIDs into other builds. Depth 0 means "not expanded", which keeps
+  // the query disabled so the initial render stays local-only.
+  const [upstreamDepth, setUpstreamDepth] = React.useState(0)
+  const [downstreamDepth, setDownstreamDepth] = React.useState(0)
+
+  const expandDirection: LineageDirection | null =
+    upstreamDepth > 0 && downstreamDepth > 0 ? 'both'
+      : upstreamDepth > 0 ? 'upstream'
+        : downstreamDepth > 0 ? 'downstream'
+          : null
+  // The endpoint takes a single max_depth for both walk directions, so asymmetric
+  // depths can't be expressed. max() over-fetches in one direction but never
+  // under-fetches, and the extra nodes are genuine lineage, so showing them is
+  // correct. If asymmetry ever matters, two per-direction queries merge cleanly
+  // (dedup is by node/edge id).
+  const expandDepth = Math.max(upstreamDepth, downstreamDepth)
+
+  const {
+    data: expansion,
+    isFetching: expanding,
+    error: expandError,
+  } = useQuery({
+    queryKey: ['build-lineage', build?.uuid, expandDirection, expandDepth],
+    queryFn: () => getBuildLineage(build!.uuid, expandDirection!, expandDepth),
+    enabled: Boolean(build?.uuid) && expandDirection !== null,
+    staleTime: 60_000,
+    retry: false,
+    // Keep the current graph on screen while a deeper level loads.
+    placeholderData: (prev) => prev,
+  })
+
+  const expandedGraph = React.useMemo(() => {
+    // expandDirection is the source of truth for "is the graph expanded":
+    // placeholderData deliberately retains the previous level's data across key
+    // changes, so Reset view has to be gated on the direction, not on `expansion`.
+    if (!expansion || !expandDirection || !build?.uuid) return null
+    const graph = jobstatsToGraph(expansion.targets, build.uuid)
+    // buildGraphData keys this build's targets by name (planned targets have no
+    // uuid at all), while the API keys them by uuid. Alias the API's own-build
+    // target nodes onto the local form so the two copies collapse into one.
+    const rename = new Map<string, string>()
+    for (const node of graph.nodes) {
+      if (node.type !== 'Build' || node.foreignBuild) continue
+      const name = graph.targetNamesById.get(node.id)
+      if (name) rename.set(node.id, `target-${name}`)
+    }
+    const { nodes, links } = renameNodes(graph.nodes, graph.links, rename)
+    return { nodes, links, artifactIds: graph.artifactIds }
+  }, [expansion, expandDirection, build?.uuid])
+
+  const { nodes: allNodes, links: allLinks, artifactIds } = React.useMemo(
+    () => (expandedGraph ? mergeGraphs(baseGraph, expandedGraph) : baseGraph),
+    [baseGraph, expandedGraph]
   )
 
   // Fetch artifact names for all UUID-shaped artifact IDs
@@ -293,7 +346,13 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
     return allNodes.map((node) => {
       const enriched = artifactMap.get(node.id)
       if (enriched) {
-        return { ...node, title: enriched.name, type: enriched.type }
+        // Expanded nodes already carry a resolved name/type from the lineage
+        // API, so fall back to those if this artifact's lookup came back empty.
+        return {
+          ...node,
+          title: enriched.name || node.title,
+          type: enriched.type ?? node.type,
+        }
       }
       return node
     })
@@ -318,8 +377,6 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
 
   // Navigation state
   const [focusNodeId, setFocusNodeId] = React.useState<string | null>(initialFocusNodeId ?? null)
-  const [upstreamLevels, setUpstreamLevels] = React.useState(Infinity)
-  const [downstreamLevels, setDownstreamLevels] = React.useState(Infinity)
   const [partial, setPartial] = React.useState(false)
   const [artifactNavNode, setArtifactNavNode] = React.useState<{ node: ElkNodeEx; hfUrl: string | null } | null>(null)
   const router = useRouter()
@@ -334,14 +391,6 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
     [showFocusNode, initialFocusNodeId, enrichedNodes]
   )
 
-  const { filteredNodes, filteredLinks } = React.useMemo(() => {
-    if (!focusNodeId || (upstreamLevels === Infinity && downstreamLevels === Infinity)) {
-      return { filteredNodes: enrichedNodes, filteredLinks: allLinks }
-    }
-    const sub = getSubgraph(focusNodeId, downstreamLevels, upstreamLevels, enrichedNodes, allLinks)
-    return { filteredNodes: sub.nodes, filteredLinks: sub.links }
-  }, [focusNodeId, upstreamLevels, downstreamLevels, enrichedNodes, allLinks])
-
   const handleNodeClick = (node: ElkNodeEx) => {
     if (!showFocusNode) {
       setFocusNodeId(node.id)
@@ -352,29 +401,23 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
     }
   }
 
+  // Purely a viewport action: it re-centers without discarding lineage already
+  // fetched, so the partial banner stays as accurate as it was.
   const handleFocusNode = () => {
     if (!focusNodeId) return
-    setUpstreamLevels(Infinity)
-    setDownstreamLevels(Infinity)
-    setPartial(false)
     graphRef.current?.centerOnNode?.(focusNodeId)
   }
 
-  const handleUpstream = () => {
-    if (!focusNodeId) return
-    const newUp = upstreamLevels === Infinity ? 2 : upstreamLevels + 1
-    const sub = getSubgraph(focusNodeId, downstreamLevels, newUp, enrichedNodes, allLinks)
-    setUpstreamLevels(sub.hasMoreUpstream ? newUp : Infinity)
-    setPartial(sub.hasMoreUpstream || sub.hasMoreDownstream)
-  }
+  // Each click pulls in one more hop of lineage from other builds. Clamped to 50,
+  // which is the endpoint's ceiling (it rejects anything higher with a 400).
+  const handleUpstream = () => setUpstreamDepth((depth) => Math.min(depth + 1, 50))
+  const handleDownstream = () => setDownstreamDepth((depth) => Math.min(depth + 1, 50))
 
-  const handleDownstream = () => {
-    if (!focusNodeId) return
-    const newDown = downstreamLevels === Infinity ? 2 : downstreamLevels + 1
-    const sub = getSubgraph(focusNodeId, newDown, upstreamLevels, enrichedNodes, allLinks)
-    setDownstreamLevels(sub.hasMoreDownstream ? newDown : Infinity)
-    setPartial(sub.hasMoreUpstream || sub.hasMoreDownstream)
-  }
+  // The banner now reports whether the *backend* has more lineage to give.
+  React.useEffect(() => {
+    if (!expansion || !expandDirection) return
+    setPartial(expansion.truncated || expansion.expandable.length > 0)
+  }, [expansion, expandDirection])
 
   const noLineage = !loading && !statusError && allNodes.length === 0
 
@@ -387,7 +430,7 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
             size="sm"
             kind="ghost"
             renderIcon={ArrowLeft}
-            disabled={!focusNodeId}
+            disabled={!build?.uuid || expanding}
             onClick={handleUpstream}
             iconDescription="One level upstream"
           >
@@ -408,7 +451,7 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
             size="sm"
             kind="ghost"
             renderIcon={ArrowRight}
-            disabled={!focusNodeId}
+            disabled={!build?.uuid || expanding}
             onClick={handleDownstream}
             iconDescription="One level downstream"
           >
@@ -453,8 +496,10 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
               itemText="Reset view"
               onClick={() => {
                 setFocusNodeId(null);
-                setUpstreamLevels(Infinity);
-                setDownstreamLevels(Infinity);
+                // Dropping the depths to 0 disables the expansion query, so the
+                // graph falls back to this build's own lineage.
+                setUpstreamDepth(0);
+                setDownstreamDepth(0);
                 setPartial(false);
                 graphRef.current?.resetZoom();
               }}
@@ -466,6 +511,20 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
       </div>
 
       {/* Status messages */}
+      {expanding && (
+        <div className={styles.partialMessage}>
+          <InlineLoading description="Expanding lineage…" status="active" />
+        </div>
+      )}
+
+      {/* Kept out of the main error branch on purpose: a failed expansion must
+          not discard the lineage already on screen. */}
+      {!expanding && expandError && (
+        <div className={styles.partialMessage}>
+          Could not expand lineage: {(expandError as Error).message || String(expandError)}
+        </div>
+      )}
+
       {partial && (
         <div className={styles.partialMessage}>
           The lineage graph is partially displayed. Click Upstream or Downstream
@@ -502,10 +561,14 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
                 description="Lineage is rendering…"
               />
             )}
+            {/* Depth is enforced by the backend traversal, so everything it
+                returns is meant to be shown — no client-side level filtering.
+                `allLinks` must be this same merged set: Graph derives its "…"
+                stub nodes by comparing it against `links`. */}
             <Graph
               ref={graphRef}
-              nodes={filteredNodes}
-              links={filteredLinks}
+              nodes={enrichedNodes}
+              links={allLinks}
               allLinks={allLinks}
               selectedNode={currentArtifactNode}
               onClick={handleNodeClick}

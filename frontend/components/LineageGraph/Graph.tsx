@@ -26,6 +26,10 @@ export interface ElkNodeEx extends ElkNode {
   type?: NodeType | string
   highlight?: boolean
   planned?: boolean
+  /** Node belongs to a build other than the one being viewed. */
+  foreignBuild?: boolean
+  /** Owning build uuid, set on cross-build nodes. */
+  buildId?: string
   children?: ElkNodeEx[]
 }
 
@@ -174,6 +178,9 @@ function GraphComponent(props: GraphProps, ref: React.Ref<GraphHandle>) {
         type: src?.type ?? elkNode.type,
         highlight: src?.highlight ?? elkNode.highlight,
         subtitle: src?.subtitle ?? elkNode.subtitle,
+        planned: src?.planned ?? elkNode.planned,
+        foreignBuild: src?.foreignBuild ?? elkNode.foreignBuild,
+        buildId: src?.buildId ?? elkNode.buildId,
       }
       return (
         <GraphNode

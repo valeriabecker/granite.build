@@ -74,6 +74,19 @@
   }
 }
 
+// Nodes pulled in from another build by an Upstream/Downstream expansion.
+// Deliberately no opacity change (unlike .nodeWrapperPlanned) — these are real,
+// completed records, just owned elsewhere. Must stay after
+// .nodeWrapperBuildType, whose `border-left: none` would otherwise win at equal
+// specificity and drop the accent on cross-build target nodes.
+.nodeWrapperForeign {
+  :global(.cds--cc--card-node--button) {
+    border-left: 3px solid var(--cds-border-interactive, #0f62fe) !important;
+    outline: 1px dotted var(--cds-border-subtle-02, #c6c6c6) !important;
+    outline-offset: -1px;
+  }
+}
+
 .iconColumn {
   padding-top: 0.25rem !important;
   margin-right: 0.25rem;

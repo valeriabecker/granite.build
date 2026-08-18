@@ -27,8 +27,12 @@ so a change to the filtering logic or the facet shape it depends on would
 fail here.
 """
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
 
 from gbserver.api import lineage as lineage_mod
 from gbserver.lineage.openlineage_models import ArtifactGraphRequest, TagSearchRequest
@@ -227,3 +231,136 @@ def test_get_artifact_graph_excludes_run_with_no_owner_or_namespace():
             ArtifactGraphRequest(artifact_name="dataset-x", direction="both"),
         )
     assert resp.runs == []
+
+
+# ------------------------------------------------------- build graph (direction)
+#
+# GET /lineage/build/{id} serves two different shapes: with no `direction` it
+# returns only the build's own targets (the shape the dashboard renders on load),
+# and with a direction it traverses cross-build lineage. The frontend's
+# Upstream/Downstream buttons depend on both the legacy default staying
+# untouched and on the argument validation below, so guard them here. The
+# traversal itself is covered by test/unit/lineage/test_jobstats_builder.py.
+
+BUILD_ID = "build-1"
+
+
+def _fake_build_storage():
+    """Storage stub whose build lookup succeeds and whose targets are empty."""
+    build = SimpleNamespace(uuid=BUILD_ID, username="member", space_name=MY_SPACE)
+    return SimpleNamespace(
+        build_storage=SimpleNamespace(get_by_uuid=lambda uuid: build),
+        target_storage=SimpleNamespace(get_by_where=lambda where: []),
+    )
+
+
+@contextmanager
+def _build_endpoint_stubs(lineage_store):
+    """Stub out storage, authorization and the lineage store for the endpoint.
+
+    `authorize_build_read_access` and `isinstance(build, StoredBuild)` are both
+    bypassed — access filtering is exercised by the tests above; these cases are
+    about argument handling only.
+    """
+    with (
+        patch.object(
+            lineage_mod, "get_admin_storage", return_value=_fake_build_storage()
+        ),
+        patch.object(lineage_mod, "authorize_build_read_access", return_value=None),
+        patch.object(lineage_mod, "StoredBuild", SimpleNamespace),
+        patch(
+            "gbserver.lineage.jobstats.get_lineage_store", return_value=lineage_store
+        ),
+    ):
+        yield
+
+
+def _recording_lineage_store():
+    """Lineage store stub that records the traversal args it was called with."""
+    calls: list[tuple] = []
+
+    def get_lineage_graph(storage, build_id, direction, max_depth):
+        calls.append((build_id, direction, max_depth))
+        return {
+            "root_build_id": build_id,
+            "targets": [{"out": []}],
+            "truncated": True,
+            "expandable": [
+                {"build_id": "build-2", "target_id": "t-2", "direction": direction}
+            ],
+        }
+
+    store = SimpleNamespace(
+        get_lineage_graph=get_lineage_graph,
+        create_jobstats_for_target=lambda *a, **kw: (None, {}),
+    )
+    return store, calls
+
+
+def test_get_build_jobstats_without_direction_skips_traversal():
+    """The default (no `direction`) path must stay own-targets-only."""
+    store, calls = _recording_lineage_store()
+    with _build_endpoint_stubs(store):
+        resp = lineage_mod.get_build_jobstats(
+            _fake_request("member", "member@example.com"), BUILD_ID
+        )
+    assert calls == [], "traversal must not run when no direction is requested"
+    assert resp.targets == []
+    assert resp.truncated is False
+    assert resp.expandable == []
+
+
+def test_get_build_jobstats_with_direction_returns_traversal_result():
+    store, calls = _recording_lineage_store()
+    with _build_endpoint_stubs(store):
+        resp = lineage_mod.get_build_jobstats(
+            _fake_request("member", "member@example.com"),
+            BUILD_ID,
+            direction="upstream",
+            max_depth=3,
+        )
+    assert calls == [(BUILD_ID, "upstream", 3)]
+    assert resp.truncated is True
+    assert [(e.build_id, e.direction) for e in resp.expandable] == [
+        ("build-2", "upstream")
+    ]
+
+
+def test_get_build_jobstats_rejects_unknown_direction():
+    store, _ = _recording_lineage_store()
+    with _build_endpoint_stubs(store):
+        with pytest.raises(HTTPException) as excinfo:
+            lineage_mod.get_build_jobstats(
+                _fake_request("member", "member@example.com"),
+                BUILD_ID,
+                direction="sideways",
+            )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.parametrize("max_depth", [0, 51, -2])
+def test_get_build_jobstats_rejects_out_of_range_max_depth(max_depth):
+    store, _ = _recording_lineage_store()
+    with _build_endpoint_stubs(store):
+        with pytest.raises(HTTPException) as excinfo:
+            lineage_mod.get_build_jobstats(
+                _fake_request("member", "member@example.com"),
+                BUILD_ID,
+                direction="both",
+                max_depth=max_depth,
+            )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.parametrize("max_depth", [-1, 1, 50])
+def test_get_build_jobstats_accepts_boundary_max_depth(max_depth):
+    """-1 means "full map"; 1 and 50 are the inclusive bounds."""
+    store, calls = _recording_lineage_store()
+    with _build_endpoint_stubs(store):
+        lineage_mod.get_build_jobstats(
+            _fake_request("member", "member@example.com"),
+            BUILD_ID,
+            direction="downstream",
+            max_depth=max_depth,
+        )
+    assert calls == [(BUILD_ID, "downstream", max_depth)]
