@@ -25,6 +25,7 @@ import wandb
 from huggingface_hub import dataset_info, model_info
 
 from gbcommon.uri.hf import HfURI
+from gbserver.lineage.jobstats_builder import LINEAGE_PRODUCER_URL
 from gbserver.lineage.openlineage_service import LineageService
 from gbserver.lineage.openlineage_utils import (
     get_hf_artifact_uri,
@@ -32,7 +33,6 @@ from gbserver.lineage.openlineage_utils import (
     parse_hf_uri,
     parse_hf_url,
 )
-from gbserver.lineage.jobstats_builder import LINEAGE_PRODUCER_URL
 from gbserver.types.constants import (
     GBSERVER_WANDB_API_KEY,
     GBSERVER_WANDB_BASE_URL,

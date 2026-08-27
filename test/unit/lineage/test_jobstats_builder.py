@@ -1,3 +1,4 @@
+from libgbtest.lineage.mock_lineage_service import MockLineageService
 from libgbtest.utils import AbstractSingletonStorageUsingTest
 
 from gbserver.lineage.jobstats_builder import (
@@ -17,7 +18,25 @@ from gbserver.types.artifact import ArtifactType
 from gbserver.types.status import Status
 from gbserver.utils.utils import get_utc_time
 
-from libgbtest.lineage.mock_lineage_service import MockLineageService
+
+def _normalize_run_ids(value):
+    """Replace every ``runId`` with a placeholder, recursively.
+
+    Run ids are fresh random uuids by design (a deleted wandb run must be
+    re-creatable, so the id cannot be derived from the target/output), which makes
+    them the one field that legitimately differs between two builds of the same
+    event. Blanking them keeps these tests asserting what they are about -- that
+    both backends delegate to the same builder and so produce the same event
+    *shape* -- instead of failing on the intended nondeterminism.
+    """
+    if isinstance(value, dict):
+        return {
+            k: ("<runId>" if k == "runId" else _normalize_run_ids(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_run_ids(v) for v in value]
+    return value
 
 
 def _make_build(storage, build_id: str, space_name: str = "test-space") -> StoredBuild:
@@ -84,7 +103,9 @@ class TestBuildEventsForTargetSharedAcrossBackends(AbstractSingletonStorageUsing
     def test_identical_output_wandb_and_noop(self):
         build = _make_build(self.storage, "b1")
         _make_artifact(self.storage, "in1")
-        _make_artifact(self.storage, "out1", created_by_build_id="b1", created_by_target_id="t1")
+        _make_artifact(
+            self.storage, "out1", created_by_build_id="b1", created_by_target_id="t1"
+        )
         target = _make_target(
             self.storage,
             "t1",
@@ -93,7 +114,9 @@ class TestBuildEventsForTargetSharedAcrossBackends(AbstractSingletonStorageUsing
             output_artifacts={"out": ["out1"]},
         )
 
-        direct_events, direct_dict = build_events_for_target(self.storage, build, target)
+        direct_events, direct_dict = build_events_for_target(
+            self.storage, build, target
+        )
 
         wandb_store = WandBLineageStore.__new__(WandBLineageStore)
         wandb_store._service = MockLineageService()
@@ -106,8 +129,16 @@ class TestBuildEventsForTargetSharedAcrossBackends(AbstractSingletonStorageUsing
             self.storage, target, build
         )
 
-        assert direct_events == wandb_events == noop_events
-        assert direct_dict == wandb_dict == noop_dict
+        assert (
+            _normalize_run_ids(direct_events)
+            == _normalize_run_ids(wandb_events)
+            == _normalize_run_ids(noop_events)
+        )
+        assert (
+            _normalize_run_ids(direct_dict)
+            == _normalize_run_ids(wandb_dict)
+            == _normalize_run_ids(noop_dict)
+        )
         assert len(direct_events) == 1
 
 
@@ -115,7 +146,9 @@ class TestNoopReturnsRealEvents(AbstractSingletonStorageUsingTest):
     def test_returns_non_empty_events(self):
         build = _make_build(self.storage, "b1")
         _make_artifact(self.storage, "in1")
-        _make_artifact(self.storage, "out1", created_by_build_id="b1", created_by_target_id="t1")
+        _make_artifact(
+            self.storage, "out1", created_by_build_id="b1", created_by_target_id="t1"
+        )
         target = _make_target(
             self.storage,
             "t1",
@@ -125,7 +158,9 @@ class TestNoopReturnsRealEvents(AbstractSingletonStorageUsingTest):
         )
 
         store = NoopLineageStore()
-        events, events_dict = store.create_jobstats_for_target(self.storage, target, build)
+        events, events_dict = store.create_jobstats_for_target(
+            self.storage, target, build
+        )
 
         assert events != []
         assert events_dict != {}
@@ -140,8 +175,18 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
         build_b = _make_build(self.storage, "build-b")
         build_c = _make_build(self.storage, "build-c")
 
-        _make_artifact(self.storage, "a-out", created_by_build_id="build-a", created_by_target_id="target-a")
-        _make_artifact(self.storage, "b-out", created_by_build_id="build-b", created_by_target_id="target-b")
+        _make_artifact(
+            self.storage,
+            "a-out",
+            created_by_build_id="build-a",
+            created_by_target_id="target-a",
+        )
+        _make_artifact(
+            self.storage,
+            "b-out",
+            created_by_build_id="build-b",
+            created_by_target_id="target-b",
+        )
 
         target_a = _make_target(
             self.storage, "target-a", "build-a", output_artifacts={"out": ["a-out"]}
@@ -162,7 +207,9 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
         build = _make_build(self.storage, "solo-build")
         _make_target(self.storage, "solo-target", "solo-build")
 
-        graph = traverse_lineage_graph(self.storage, "solo-build", direction="both", max_depth=10)
+        graph = traverse_lineage_graph(
+            self.storage, "solo-build", direction="both", max_depth=10
+        )
 
         assert graph["root_build_id"] == "solo-build"
         assert len(graph["targets"]) == 1
@@ -171,28 +218,38 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
 
     def test_upstream_from_b_includes_a(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-b", direction="upstream", max_depth=10)
+        graph = traverse_lineage_graph(
+            self.storage, "build-b", direction="upstream", max_depth=10
+        )
         assert any("target-a" in str(t) for t in graph["targets"])
 
     def test_downstream_from_a_includes_b(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-a", direction="downstream", max_depth=10)
+        graph = traverse_lineage_graph(
+            self.storage, "build-a", direction="downstream", max_depth=10
+        )
         assert any("target-b" in str(t) for t in graph["targets"])
 
     def test_both_from_b_includes_a_and_c(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-b", direction="both", max_depth=10)
+        graph = traverse_lineage_graph(
+            self.storage, "build-b", direction="both", max_depth=10
+        )
         serialized = str(graph["targets"])
         assert "target-a" in serialized
         assert "target-c" in serialized
 
     def test_max_depth_1_truncates(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-a", direction="downstream", max_depth=1)
+        graph = traverse_lineage_graph(
+            self.storage, "build-a", direction="downstream", max_depth=1
+        )
         assert graph["truncated"] is True
 
     def test_missing_build_returns_empty_graph(self):
-        graph = traverse_lineage_graph(self.storage, "does-not-exist", direction="both", max_depth=10)
+        graph = traverse_lineage_graph(
+            self.storage, "does-not-exist", direction="both", max_depth=10
+        )
         assert graph["targets"] == []
         assert graph["truncated"] is False
         assert graph["expandable"] == []
@@ -201,7 +258,9 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
         self._make_chain()
         # max_depth=1 from A downstream: B (1 hop) is included in targets;
         # C (2 hops) is beyond the cap and must show up as expandable instead.
-        graph = traverse_lineage_graph(self.storage, "build-a", direction="downstream", max_depth=1)
+        graph = traverse_lineage_graph(
+            self.storage, "build-a", direction="downstream", max_depth=1
+        )
         expandable_target_ids = {e["target_id"] for e in graph["expandable"]}
         assert "target-c" in expandable_target_ids
         assert "target-b" not in expandable_target_ids
@@ -213,7 +272,9 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
 
     def test_expandable_empty_when_depth_reaches_end(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-a", direction="downstream", max_depth=10)
+        graph = traverse_lineage_graph(
+            self.storage, "build-a", direction="downstream", max_depth=10
+        )
         assert graph["expandable"] == []
         assert graph["truncated"] is False
 
@@ -221,14 +282,18 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
         self._make_chain()
         # target-c has no downstream consumers; even at max_depth=2 (exactly
         # reaching it), it must not appear as an expandable node.
-        graph = traverse_lineage_graph(self.storage, "build-a", direction="downstream", max_depth=2)
+        graph = traverse_lineage_graph(
+            self.storage, "build-a", direction="downstream", max_depth=2
+        )
         expandable_target_ids = {e["target_id"] for e in graph["expandable"]}
         assert "target-c" not in expandable_target_ids
         assert graph["truncated"] is False
 
     def test_full_map_small_graph(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-a", direction="downstream", max_depth=-1)
+        graph = traverse_lineage_graph(
+            self.storage, "build-a", direction="downstream", max_depth=-1
+        )
         assert graph["truncated"] is False
         assert graph["expandable"] == []
         serialized = str(graph["targets"])
@@ -237,7 +302,9 @@ class TestTraverseLineageGraph(AbstractSingletonStorageUsingTest):
 
     def test_full_map_both_directions(self):
         self._make_chain()
-        graph = traverse_lineage_graph(self.storage, "build-b", direction="both", max_depth=-1)
+        graph = traverse_lineage_graph(
+            self.storage, "build-b", direction="both", max_depth=-1
+        )
         assert graph["truncated"] is False
         serialized = str(graph["targets"])
         assert "target-a" in serialized
@@ -292,4 +359,4 @@ class TestGetLineageGraphDelegation(AbstractSingletonStorageUsingTest):
         noop_result = noop_store.get_lineage_graph(self.storage, "b1", "both", 10)
         wandb_result = wandb_store.get_lineage_graph(self.storage, "b1", "both", 10)
 
-        assert noop_result == wandb_result
+        assert _normalize_run_ids(noop_result) == _normalize_run_ids(wandb_result)

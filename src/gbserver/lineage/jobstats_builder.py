@@ -225,7 +225,9 @@ def build_events_for_target(
             }
         )
 
-    started_at = targetrun.started_at.isoformat() if targetrun.started_at else event_time
+    started_at = (
+        targetrun.started_at.isoformat() if targetrun.started_at else event_time
+    )
     completed_at = targetrun.finished_at.isoformat() if targetrun.finished_at else ""
 
     base_event: Dict[str, Any] = {
@@ -277,6 +279,10 @@ def build_events_for_target(
     events_list: List[dict] = []
     events_dict: Dict[str, List[dict]] = {}
 
+    # NOTE: the number of events emitted here (one per output artifact across
+    # all output-artifact lists, or one "no-output" event below) must stay in
+    # lockstep with lineage_reconciler.expected_run_count, which derives the
+    # same count from the target in memory to detect partial records.
     for (
         target_artifact_name,
         output_artifact_list,
@@ -356,7 +362,12 @@ def build_events_for_target(
         events_list.extend(target_events)
         events_dict[target_artifact_name] = target_events
 
-    if len(targetrun.output_artifacts) == 0 and len(inputs) > 0:
+    # A target that produced no outputs still gets exactly one event, even when
+    # it has no inputs either (e.g. a pure generation/compute target). Guard
+    # only on the absence of output-artifact events, not on having inputs;
+    # otherwise an artifact-less target emits nothing and the reconciler
+    # silently marks it "recorded" without ever contacting the backend.
+    if len(targetrun.output_artifacts) == 0:
         event = {
             **base_event,
             "inputs": inputs,
@@ -532,7 +543,9 @@ def traverse_lineage_graph(
 
     for walk_direction in directions_to_walk:
         neighbor_fn = (
-            downstream_neighbors if walk_direction == "downstream" else upstream_neighbors
+            downstream_neighbors
+            if walk_direction == "downstream"
+            else upstream_neighbors
         )
         queue: List[Tuple[StoredTargetRun, int]] = [(run, 0) for run in seed_runs]
         for run in seed_runs:
