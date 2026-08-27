@@ -39,6 +39,8 @@ from gbserver.types.constants import (
 )
 from gbserver.types.status import Status
 from gbserver.utils.logger import get_logger
+from gbserver.utils.redaction import redact_sensitive, scrub_url_credentials
+from gbserver.utils.utils import get_uuid
 
 logger = get_logger(__name__)
 
@@ -208,13 +210,18 @@ def build_events_for_target(
     step_configs = []
     steps = storage.step_storage.get_by_where({"target_id": targetrun.uuid})
     for step in steps:
-        # step.config/config_dir are copied verbatim from the build's own
-        # build.yaml and can embed credentials — jobstats is readable by any
-        # space member (not just the build owner/admin, unlike get_build_archive),
-        # so omit them here rather than widening who can read pipeline secrets.
+        # step.config is the rendered build.yaml input and step.metadata is
+        # runtime data the step pushed (e.g. commit_hash). jobstats is readable
+        # by any space member (not just the build owner/admin), so both are
+        # emitted with secret-*named* keys masked via redact_sensitive, which
+        # also scrubs userinfo@ credentials out of any URL-shaped value. The
+        # definition_uri is scrubbed the same way so a credentialed BYOS clone
+        # URL (git+ssh://token@... / https://token@...) cannot leak here.
         step_configs.append(
             {
-                "uri": step.definition_uri,
+                "uri": scrub_url_credentials(step.definition_uri),
+                "config": redact_sensitive(step.config),
+                "metadata": redact_sensitive(step.metadata),
             }
         )
 
@@ -302,10 +309,47 @@ def build_events_for_target(
             # a single resumed run. Keeps counts aligned with the number
             # of output artifacts. The job_id in job_details still points
             # back to the logical target (targetrun.uuid).
-            job_id = base_event["run"]["facets"]["job_details"]["job_id"]
+            #
+            # The id is a fresh random uuid, not derived from the target and
+            # output uuids. Dedup is therefore carried entirely by the
+            # target_id tag in run.facets.tags (see LineageService.
+            # filter_unrecorded), which is why that tag must be present on
+            # EVERY emitted event: a run without it is invisible to the
+            # dedup query, cannot be counted toward expected_run_count, and
+            # is unreclaimable -- no later scan can find it or replace it.
+            #
+            # Random is REQUIRED here, not incidental. Deriving the id from
+            # the target/output (the scheme this replaced) means a run
+            # DELETED in wandb can never be re-created: wandb refuses a
+            # deleted run's id, and a derived id recomputes to that same
+            # tombstoned value on every later scan, so the target becomes
+            # permanently unrecordable. That happened with intentional
+            # deletions; see commit 5824ae99 and the extended note in
+            # WandBLineageService.filter_unrecorded, which also explains the
+            # partial-record trade-off this buys and why it is accepted.
+            #
+            # Tag the run with the output artifact it represents. base_event
+            # cannot carry this: its tags are shared by every event of the
+            # target, while output_uuid identifies just this one. Run ids are
+            # random and carry no output information, so without this tag the
+            # only way to find the run for a given output is to fetch the
+            # target's runs and inspect their outputs facet; with it the
+            # lookup is a tag filter like the target_id ones above.
+            #
+            # Additive only: it does not affect dedup. filter_unrecorded
+            # matches on "target_id=" tags and skips every other key, and
+            # tags serialize generically as "k=v"
+            # (WandBLineageService._process_event), so nothing else changes.
             event["run"] = {
                 **base_event["run"],
-                "runId": f"{job_id}-{output_uuid}",
+                "runId": get_uuid(),
+                "facets": {
+                    **base_event["run"]["facets"],
+                    "tags": {
+                        **base_event["run"]["facets"]["tags"],
+                        "output_id": output_uuid,
+                    },
+                },
             }
             _add_jobstats_mirror_fields(event)
             target_events.append(event)
@@ -317,6 +361,13 @@ def build_events_for_target(
             **base_event,
             "inputs": inputs,
             "outputs": [],
+            # Explicit random runId: inheriting base_event's would reuse
+            # targetrun.uuid, the deterministic id this design replaced, and
+            # a re-record would silently resume that one run instead of
+            # writing a new one. The target_id tag comes along in
+            # base_event["run"]["facets"]["tags"], keeping this event
+            # dedupable like the per-output ones.
+            "run": {**base_event["run"], "runId": get_uuid()},
         }
         _add_jobstats_mirror_fields(event)
         events_list.append(event)
@@ -406,33 +457,6 @@ def build_event_for_artifact(
     }
     _add_jobstats_mirror_fields(event)
     return event
-
-
-def _resolve_effective_targetrun(
-    storage: SingletonAdminStorage, targetrun: StoredTargetRun
-) -> StoredTargetRun:
-    """Resolve a skipped-for-prerun targetrun to the original run's data.
-
-    Skipped runs carry no input/output artifacts of their own; they alias an
-    earlier run with the same target_hash. Mirrors the resolution previously
-    done in WandBLineageStore.create_jobstats_for_target.
-    """
-    if not targetrun.skipped_for_prerun_target_id:
-        return targetrun
-    original = storage.target_storage.get_by_uuid(targetrun.skipped_for_prerun_target_id)
-    if original is not None and isinstance(original, StoredTargetRun):
-        return original.model_copy(
-            update={
-                "uuid": targetrun.uuid,
-                "build_id": targetrun.build_id,
-            }
-        )
-    logger.warning(
-        "Skipped target %s references unknown original %s",
-        targetrun.uuid,
-        targetrun.skipped_for_prerun_target_id,
-    )
-    return targetrun
 
 
 def traverse_lineage_graph(
@@ -585,9 +609,7 @@ def create_jobstats_for_visited_target(
 ) -> Tuple[List[dict], Dict[str, List[dict]]]:
     """Build jobstats for a target-run visited during traversal.
 
-    Thin wrapper around build_events_for_target that resolves
-    skipped-for-prerun aliasing first, matching create_jobstats_for_target's
-    behavior on both backends.
+    Thin wrapper around build_events_for_target, matching
+    create_jobstats_for_target's behavior on both backends.
     """
-    targetrun = _resolve_effective_targetrun(storage, targetrun)
     return build_events_for_target(storage, build, targetrun)

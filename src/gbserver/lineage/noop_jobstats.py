@@ -71,18 +71,6 @@ class NoopLineageStore(ILineageStore):
             assert isinstance(build_result, StoredBuild)
             build = build_result
 
-        if targetrun.skipped_for_prerun_target_id:
-            original = storage.target_storage.get_by_uuid(
-                targetrun.skipped_for_prerun_target_id
-            )
-            if original is not None and isinstance(original, StoredTargetRun):
-                targetrun = original.model_copy(
-                    update={
-                        "uuid": targetrun.uuid,
-                        "build_id": targetrun.build_id,
-                    }
-                )
-
         return build_events_for_target(storage, build, targetrun)
 
     def create_jobstats_for_original_artifact(

@@ -5,7 +5,14 @@ It lets you point at a `buildtest.yaml` file directly and run it through pytest
 without having to author or remember the path of a concrete test class.
 
 ```shell
+# Run a buildtest.yaml (assumes a sibling build.yaml)
 gbtest path/to/buildtest.yaml [extra pytest args...]
+
+# Run against an explicit executable build.yaml (need not be named build.yaml)
+gbtest path/to/buildtest.yaml -f path/to/exec-build.yaml
+
+# Generate a skeleton buildtest.yaml from an executable build.yaml
+gbtest render path/to/build.yaml [-o buildtest.yaml]
 ```
 
 It is installed automatically by `make venv` (via the `[project.scripts]`
@@ -41,7 +48,6 @@ simulate_step_failure: true            # inject one environment failure to exerc
 space_uri: null                   # if set, takes precedence over the space's
                                   #   git_repo_uri in the gb_spaces table
                                   #   (relative file:// or filesystem paths resolve against this YAML's dir)
-skip_target_names: []             # targets expected to be skipped on a 2nd run
 tests:                            # which test methods to run (see below)
   - runner
   - runner_cancellation
@@ -59,7 +65,6 @@ tests:                            # which test methods to run (see below)
 | `timeout_minutes`      | int             | `30`                               | Wall-clock cap for the build. |
 | `simulate_step_failure`     | bool            | `true`                             | If `true`, signals the environment to inject one simulated failure to exercise the retry path. |
 | `space_uri`            | str \| null     | `null`                             | When set, takes precedence over the `git_repo_uri` recorded for `space_name` in the `gb_spaces` table — the BuildRunner resolves `space://` URIs from this value instead of cloning the registered git repo. Relative `file://` URIs and bare relative filesystem paths resolve against this YAML's directory. PR creation and verification are skipped automatically (no GitHub repo). |
-| `skip_target_names`    | list[str]       | `[]`                               | Targets expected to be skipped on a second run (used with retry/two-build flows). |
 | `tests`                | list[str]       | `["runner", "runner_cancellation"]` | Which test methods opt in for this spec. Unknown values fail at load time. |
 
 `ExpectedTarget` fields (all required):
@@ -106,6 +111,68 @@ gbtest test-data/integration/ibm/buildrunner/k8s/1step/cpu/buildtest.yaml -vv
 gbtest test-data/integration/ibm/buildrunner/k8s/1step/cpu/buildtest.yaml \
        --collect-only -q
 ```
+
+## Testing a parameterized sample/template
+
+Samples and templates often use the `gb` CLI's `$${...}` parameterization, but a
+`buildtest.yaml` needs a concrete, executable `build.yaml`. The convention
+([issue #278](https://github.com/ibm-granite/granite.build/issues/278)) is:
+
+```shell
+# 1. Render the executable build from parameters.
+#    (Skip this step if the build file is NOT parameterized.)
+gb build describe -f template/build.yaml --raw --param ENVIRONMENT=skypilot/aws > exec-build.yaml
+
+# 2. Generate the initial buildtest.yaml from the executable build.
+gbtest render exec-build.yaml -o buildtest.yaml
+
+# 3. Edit buildtest.yaml to confirm the verification values — replace the
+#    step_count FIXME. See "gbtest render" below.
+
+# 4. Run it — -f points gbtest at the executable build.
+gbtest buildtest.yaml -f exec-build.yaml
+```
+
+`gb build describe --raw` (or `gb build start --dry-run`) is the entry point for
+parameter substitution — both reuse the same engine as `gb build start`, so `gb`
+stays the single source of truth; `gbtest` only *consumes* an executable
+`build.yaml`.
+
+Both write the resolved `build.yaml` verbatim to **stdout** (no banner, so
+`… > exec-build.yaml` is pipe-safe); status/confirmation messages go to
+**stderr**. `gb build start --dry-run --save-build-file <file>` writes the
+resolved build to `<file>` instead and prints only a `✅ wrote …` note (to
+stderr).
+
+### `gbtest render`
+
+`gbtest render <build.yaml> [-o <out>]` reads an executable `build.yaml` and emits
+a **skeleton** `buildtest.yaml` (to stdout, or to `-o`). It:
+
+- derives `input_artifact_count` / `output_artifact_count` from each target's
+  declared inputs/outputs;
+- emits a `FIXME` for `step_count`, the one value it cannot determine statically
+  (it is environment-dependent), which you must replace;
+- defaults `jobstats_count` to `-1` (skip) — jobstats are not asserted at run
+  time yet, so it is not forced to a value;
+- pre-sets `simulate_step_failure: false` (no step-retry testing) and
+  `tests: [runner]` (no cancellation run).
+
+The `step_count` `FIXME` **fails validation** if left unreplaced: loading the spec
+(on any `gbtest` run) raises a clear error naming the field, so you cannot
+accidentally run a half-filled skeleton. Replace `step_count` with the observed
+step count (or `-1` to skip that assertion).
+
+> `output_artifact_count` counts *declared* outputs; a declared output whose
+> command emits no `LLMB_ARTIFACT` marker will over-count — the first real run
+> catches it.
+
+### The `-f` override
+
+`gbtest <buildtest.yaml> -f <build.yaml>` runs the test against the given
+`build.yaml` instead of the sibling default. The path resolves against the current
+directory (where you ran `gbtest`), so a rendered build kept under a distinct name
+(e.g. `exec-build.yaml`) works without renaming.
 
 ## How it works
 
