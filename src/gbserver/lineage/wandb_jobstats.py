@@ -108,16 +108,32 @@ class WandBLineageStore(ILineageStore):
     ) -> None:
         events, _ = self.create_jobstats_for_target(storage, targetrun, build)
         if not events:
-            # No events means emit_event is never called, yet the caller
-            # (reconciler) will still mark the target recorded — a silent no-op
-            # that leaves nothing in the backend. Surface it rather than hide it.
-            logger.warning(
-                "No lineage events built for target %s (name=%s) in build %s; "
-                "nothing emitted to the lineage backend",
-                targetrun.uuid,
-                targetrun.name,
-                build.uuid,
+            # No events means emit_event is never called. For a fully
+            # artifact-less target that is the intended outcome — there is no
+            # lineage to record, and `select_recordable_targets` filters such
+            # targets out before the reconciler ever gets here. Any *other*
+            # empty result is a silent no-op: the caller marks the target
+            # recorded while nothing reaches the backend, so warn on that.
+            artifact_less = not targetrun.input_artifacts and not any(
+                targetrun.output_artifacts.values()
             )
+            if artifact_less:
+                logger.debug(
+                    "No lineage events for artifact-less target %s (name=%s) in "
+                    "build %s; nothing to record",
+                    targetrun.uuid,
+                    targetrun.name,
+                    build.uuid,
+                )
+            else:
+                logger.warning(
+                    "No lineage events built for target %s (name=%s) in build %s "
+                    "despite it having artifacts; nothing emitted to the lineage "
+                    "backend",
+                    targetrun.uuid,
+                    targetrun.name,
+                    build.uuid,
+                )
             return
         for event in events:
             self._service.emit_event(event)
