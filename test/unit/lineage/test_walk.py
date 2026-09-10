@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+
+# Copyright LLM.build Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the lineage graph traversal.
+
+The cross-check tests compare against ``reference_walk``, an independent
+re-derivation written against the specification. They assert on ``(node, depth)``
+pairs, not just which nodes were reached: the prototype's equivalent check compares
+only key sets and skips depths -- a gap its own docstring admits -- and depth is
+precisely what "shortest path" promises.
+"""
+
+import random
+
+import pytest
+
+from gbserver.lineage.walk import (
+    DEFAULT_MAX_DEPTH,
+    Direction,
+    LineageGraph,
+    walk_lineage,
+)
+from gbserver.storage.stored_lineage_row import TERMINAL, StoredLineageRow
+
+from .reference_walk import reference_walk
+
+
+class FakeStorage:
+    """In-memory stand-in implementing only the two hop queries.
+
+    Counts queries, so a test can assert the walk costs one query per level rather
+    than one per node.
+    """
+
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+        self.queries = 0
+
+    def get_rows_by_source(self, sources: list) -> list:
+        self.queries += 1
+        wanted = {s for s in sources if s and s != TERMINAL}
+        return [r for r in self.rows if r.source in wanted]
+
+    def get_rows_by_target(self, targets: list) -> list:
+        self.queries += 1
+        wanted = {t for t in targets if t and t != TERMINAL}
+        return [r for r in self.rows if r.target in wanted]
+
+
+def row(job_id: str, source: str, target: str, build_id: str = "B") -> StoredLineageRow:
+    return StoredLineageRow(
+        job_id=job_id, source=source, target=target, build_id=build_id
+    )
+
+
+def chain(*nodes: str) -> list:
+    """Rows forming a linear chain a -> b -> c ..."""
+    return [row(f"J{i}", nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)]
+
+
+def keys(graph: LineageGraph) -> set:
+    return {(r.job_id, r.source, r.target) for r in graph.rows}
+
+
+class TestDirections:
+    def test_descendants_follows_source_to_target(self):
+        storage = FakeStorage(chain("a", "b", "c"))
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        assert graph.depths == {"a": 0, "b": 1, "c": 2}
+
+    def test_ancestors_follows_target_to_source(self):
+        storage = FakeStorage(chain("a", "b", "c"))
+        graph = walk_lineage(storage, ["c"], Direction.ANCESTORS)
+        assert graph.depths == {"c": 0, "b": 1, "a": 2}
+
+    def test_descendants_does_not_walk_backward(self):
+        storage = FakeStorage(chain("a", "b", "c"))
+        graph = walk_lineage(storage, ["c"], Direction.DESCENDANTS)
+        assert graph.depths == {"c": 0}
+        assert not graph.rows
+
+    def test_both_reaches_each_side(self):
+        storage = FakeStorage(chain("a", "b", "c", "d"))
+        graph = walk_lineage(storage, ["c"], Direction.BOTH)
+        assert graph.depths == {"c": 0, "b": 1, "a": 2, "d": 1}
+
+
+class TestBothDeduplicates:
+    def test_a_row_reached_both_ways_appears_once(self):
+        """Seeding at both ends of one row: each direction reaches it."""
+        storage = FakeStorage([row("J", "a", "b")])
+        graph = walk_lineage(storage, ["a", "b"], Direction.BOTH)
+        assert len(graph.rows) == 1
+
+    def test_diamond_counts_each_row_once(self):
+        rows = [
+            row("J1", "top", "left"),
+            row("J2", "top", "right"),
+            row("J3", "left", "bottom"),
+            row("J4", "right", "bottom"),
+        ]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["top", "bottom"], Direction.BOTH)
+        assert len(graph.rows) == 4
+        assert len(keys(graph)) == 4
+
+
+class TestTerminals:
+    def test_creation_row_is_included_but_not_followed(self):
+        rows = [row("C", TERMINAL, "a")] + chain("a", "b")
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["b"], Direction.ANCESTORS)
+        assert ("C", TERMINAL, "a") in keys(graph)
+        # The terminal marker is not a node.
+        assert TERMINAL not in graph.depths
+        assert graph.depths == {"b": 0, "a": 1}
+
+    def test_deletion_row_is_included_but_not_followed(self):
+        rows = chain("a", "b") + [row("D", "b", TERMINAL)]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        assert ("D", "b", TERMINAL) in keys(graph)
+        assert TERMINAL not in graph.depths
+
+    def test_two_unrelated_creations_do_not_join(self):
+        """Every creation row shares the terminal marker; following it would make
+        them one node and invent provenance.
+        """
+        rows = [row("C1", TERMINAL, "a"), row("C2", TERMINAL, "b")]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.BOTH)
+        assert "b" not in graph.depths
+
+    def test_terminal_seed_yields_empty_graph(self):
+        storage = FakeStorage([row("C", TERMINAL, "a")])
+        graph = walk_lineage(storage, [TERMINAL], Direction.BOTH)
+        assert not graph.rows
+        assert graph.depths == {}
+
+
+class TestSelfLoops:
+    def test_self_loop_row_is_included_once(self):
+        storage = FakeStorage([row("S", "tbl", "tbl")])
+        graph = walk_lineage(storage, ["tbl"], Direction.DESCENDANTS)
+        assert len(graph.rows) == 1
+
+    def test_self_loop_does_not_chain_through(self):
+        """Legitimate for unversioned entities -- several runs rewriting one table
+        converge on a node -- so the walk must not loop forever.
+        """
+        rows = [row("S", "tbl", "tbl"), row("J", "tbl", "next")]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["tbl"], Direction.DESCENDANTS)
+        assert graph.depths == {"tbl": 0, "next": 1}
+
+    def test_cycle_terminates(self):
+        rows = chain("a", "b", "c") + [row("Jx", "c", "a")]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        assert graph.depths == {"a": 0, "b": 1, "c": 2}
+        # All three rows are on the path, including the one closing the cycle; "a"
+        # is simply not re-expanded.
+        assert keys(graph) == {("J0", "a", "b"), ("J1", "b", "c"), ("Jx", "c", "a")}
+
+
+class TestShortestPath:
+    def test_depth_is_the_shortest_path(self):
+        """Two routes to one node: the shorter wins."""
+        rows = [
+            row("long1", "a", "x"),
+            row("long2", "x", "y"),
+            row("long3", "y", "z"),
+            row("short", "a", "z"),
+        ]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        assert graph.depths["z"] == 1
+
+    def test_both_keeps_the_shorter_of_two_directions(self):
+        rows = [row("J1", "seed", "x"), row("J2", "x", "seed")]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["seed"], Direction.BOTH)
+        assert graph.depths["x"] == 1
+
+
+class TestLimits:
+    def test_max_depth_truncates(self):
+        storage = FakeStorage(chain("a", "b", "c", "d", "e"))
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS, max_depth=2)
+        assert graph.depths == {"a": 0, "b": 1, "c": 2}
+        assert graph.truncated
+
+    def test_exact_depth_is_not_truncated(self):
+        storage = FakeStorage(chain("a", "b"))
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS, max_depth=5)
+        assert not graph.truncated
+
+    def test_zero_depth_returns_seeds_only(self):
+        storage = FakeStorage(chain("a", "b"))
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS, max_depth=0)
+        assert graph.depths == {"a": 0}
+        assert not graph.rows
+
+    def test_wide_level_truncates(self):
+        rows = [row(f"J{i}", "a", f"out{i}") for i in range(20)]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(
+            storage, ["a"], Direction.DESCENDANTS, max_nodes_per_level=5
+        )
+        assert graph.truncated
+
+
+class TestQueryCost:
+    def test_one_query_per_level_not_per_node(self):
+        rows = [row(f"J{i}", "a", f"m{i}") for i in range(10)]
+        rows += [row(f"K{i}", f"m{i}", "end") for i in range(10)]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        # 3 levels expanded (a -> m*, m* -> end, end -> nothing), 20 rows.
+        assert storage.queries == 3
+        assert len(graph.rows) == 20
+
+    def test_both_costs_each_direction_separately(self):
+        storage = FakeStorage(chain("a", "b"))
+        walk_lineage(storage, ["a"], Direction.BOTH)
+        assert storage.queries >= 2
+
+
+class TestBuildScope:
+    def test_walk_can_stay_inside_one_build(self):
+        rows = [row("J1", "a", "b", build_id="B1"), row("J2", "b", "c", build_id="B2")]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS, build_id="B1")
+        assert graph.depths == {"a": 0, "b": 1}
+
+    def test_without_scope_the_walk_crosses_builds(self):
+        rows = [row("J1", "a", "b", build_id="B1"), row("J2", "b", "c", build_id="B2")]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        assert graph.depths == {"a": 0, "b": 1, "c": 2}
+
+
+class TestEmptyCases:
+    def test_artifact_with_no_lineage_is_an_empty_graph_not_an_error(self):
+        storage = FakeStorage([])
+        graph = walk_lineage(storage, ["orphan"], Direction.BOTH)
+        assert graph.depths == {"orphan": 0}
+        assert not graph.rows
+        assert not graph.truncated
+
+    def test_no_seeds_queries_nothing(self):
+        storage = FakeStorage(chain("a", "b"))
+        graph = walk_lineage(storage, [], Direction.BOTH)
+        assert storage.queries == 0
+        assert graph.depths == {}
+
+    def test_multiple_seeds_all_start_at_zero(self):
+        storage = FakeStorage(chain("a", "b") + chain("x", "y"))
+        graph = walk_lineage(storage, ["a", "x"], Direction.DESCENDANTS)
+        assert graph.depths == {"a": 0, "x": 0, "b": 1, "y": 1}
+
+
+class TestGraphResult:
+    def test_nodes_excludes_terminals(self):
+        storage = FakeStorage([row("C", TERMINAL, "a")])
+        graph = walk_lineage(storage, ["a"], Direction.ANCESTORS)
+        assert graph.nodes == {"a"}
+
+    def test_max_depth_reached(self):
+        storage = FakeStorage(chain("a", "b", "c"))
+        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
+        assert graph.max_depth_reached() == 2
+
+    def test_empty_graph_max_depth_is_zero(self):
+        assert LineageGraph().max_depth_reached() == 0
+
+
+def random_graph(seed: int, nodes: int = 12, edges: int = 20) -> list:
+    """Build a random graph, deliberately including the hard shapes.
+
+    Cycles, self-loops, N*M fan-out, terminals and multi-edges all arise, because
+    those are exactly where two traversals are most likely to disagree.
+    """
+    rng = random.Random(seed)
+    names = [f"n{i}" for i in range(nodes)]
+    rows = []
+    for i in range(edges):
+        kind = rng.random()
+        if kind < 0.08:
+            source, target = TERMINAL, rng.choice(names)  # creation
+        elif kind < 0.16:
+            source, target = rng.choice(names), TERMINAL  # deletion
+        elif kind < 0.24:
+            node = rng.choice(names)
+            source, target = node, node  # self-loop
+        else:
+            source, target = rng.choice(names), rng.choice(names)
+        rows.append(row(f"J{i}", source, target, build_id=rng.choice(["B1", "B2"])))
+    return rows
+
+
+class TestCrossCheckAgainstReference:
+    """The implementation must agree with an independent re-derivation.
+
+    Both the rows reached and every node's depth are compared -- the depth half is
+    what the prototype's own cross-check omits.
+    """
+
+    # Ten seeds, not thirty: at 12 nodes and 20 edges the generator saturates its
+    # structural variety early -- thirty seeds yield only seven distinct
+    # shape signatures (creation / deletion / self-loop / multi-edge present or
+    # not), and these ten already cover six of them. The seventh, a graph with no
+    # self-loop, is pinned separately below rather than left to chance.
+    @pytest.mark.parametrize("seed", range(10))
+    @pytest.mark.parametrize(
+        "direction",
+        [Direction.ANCESTORS, Direction.DESCENDANTS, Direction.BOTH],
+        ids=lambda d: d.value,
+    )
+    def test_matches_reference_on_random_graphs(self, seed, direction):
+        rows = random_graph(seed)
+        storage = FakeStorage(rows)
+        start = ["n0", "n5"]
+
+        graph = walk_lineage(storage, start, direction, max_depth=DEFAULT_MAX_DEPTH)
+        ref_keys, ref_depths, _ = reference_walk(
+            rows, start, direction, max_depth=DEFAULT_MAX_DEPTH
+        )
+
+        assert keys(graph) == ref_keys
+        assert graph.depths == ref_depths
+
+    @pytest.mark.parametrize("max_depth", [1, 2, 3, 5])
+    def test_matches_reference_under_a_depth_limit(self, max_depth):
+        rows = random_graph(7, nodes=15, edges=30)
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["n0"], Direction.BOTH, max_depth=max_depth)
+        ref_keys, ref_depths, _ = reference_walk(
+            rows, ["n0"], Direction.BOTH, max_depth=max_depth
+        )
+        assert keys(graph) == ref_keys
+        assert graph.depths == ref_depths
+
+    @pytest.mark.parametrize("seed", [0, 1, 2, 24])
+    def test_matches_reference_when_scoped_to_a_build(self, seed):
+        rows = random_graph(seed)
+        storage = FakeStorage(rows)
+        graph = walk_lineage(
+            storage, ["n0"], Direction.BOTH, max_depth=DEFAULT_MAX_DEPTH, build_id="B1"
+        )
+        ref_keys, ref_depths, _ = reference_walk(
+            rows, ["n0"], Direction.BOTH, max_depth=DEFAULT_MAX_DEPTH, build_id="B1"
+        )
+        assert keys(graph) == ref_keys
+        assert graph.depths == ref_depths
+
+    @pytest.mark.parametrize(
+        "rows,label",
+        [
+            (random_graph(24), "no-self-loop"),
+            ([row("S", "n", "n")], "only-a-self-loop"),
+            ([row("C", TERMINAL, "a"), row("D", "a", TERMINAL)], "only-terminals"),
+        ],
+        ids=lambda value: value if isinstance(value, str) else "",
+    )
+    def test_matches_reference_on_pinned_shapes(self, rows, label):
+        """Shapes the random generator reaches rarely or never."""
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["a", "n", "n0"], Direction.BOTH, max_depth=10)
+        ref_keys, ref_depths, _ = reference_walk(
+            rows, ["a", "n", "n0"], Direction.BOTH, max_depth=10
+        )
+        assert keys(graph) == ref_keys
+        assert graph.depths == ref_depths
+
+    def test_matches_reference_on_a_cartesian_job(self):
+        """The N*M shape the prototype rejects outright."""
+        rows = [
+            row("J", src, tgt) for src in ("i1", "i2", "i3") for tgt in ("o1", "o2")
+        ]
+        storage = FakeStorage(rows)
+        graph = walk_lineage(storage, ["i1"], Direction.BOTH, max_depth=10)
+        ref_keys, ref_depths, _ = reference_walk(
+            rows, ["i1"], Direction.BOTH, max_depth=10
+        )
+        assert keys(graph) == ref_keys
+        assert graph.depths == ref_depths

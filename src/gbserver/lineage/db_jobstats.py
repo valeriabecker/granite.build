@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+
+# Copyright LLM.build Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The sink that writes lineage into the local index.
+
+The write half of the lineage index: ``DBLineageService`` reads the table, this
+fills it. Same ``ILineageStore`` interface the W&B sink implements, so the
+reconciler and the watcher drive it unchanged.
+
+**The job entries are not built here.** ``create_jobstats_for_target`` in
+``wandb_jobstats`` already turns a target run into job entries -- resolving input
+and output artifacts, collecting step configs, redacting secret-named keys -- and
+``_add_jobstats_mirror_fields`` already exposes them as top-level
+``sources``/``targets``, which is exactly the shape ``to_lineage_rows`` consumes.
+Reusing it means the two sinks cannot disagree about what a build's lineage *is*;
+re-deriving it here would fork that logic and let them drift. Only the module
+functions are reused, never ``WandBLineageStore`` itself, so nothing here needs
+``wandb`` installed or configured.
+
+What this sink adds is the decomposition: one job entry with N inputs and M
+outputs becomes N*M flat rows sharing a ``job_id``. That is lossy only in
+appearance -- ``group_by_job`` recovers which inputs and which outputs an
+execution had -- and it is what makes each row an independently indexable edge.
+
+Dedup is by presence of ``target_run_uuid``, not by row count. A target either has
+its rows or it does not. It deliberately does not compare against the reconciler's
+``expected_counts``, which counts one W&B run per output artifact: that number
+never equals an N*M row count, so comparing would report every target as
+unrecorded forever and re-record on every scan.
+"""
+
+import logging
+from typing import Callable, Dict, List, Optional, Tuple
+
+from gbserver.lineage.artifact_identity import identity_from_artifact_dict
+from gbserver.lineage.decompose import LineageDecomposeError, to_lineage_rows
+from gbserver.lineage.jobstats import ILineageStore
+from gbserver.storage.artifact_registration import ArtifactRegistration
+from gbserver.storage.lineage_row_storage import ILineageRowStorage
+from gbserver.storage.singleton_storage import SingletonAdminStorage
+from gbserver.storage.stored_build import StoredBuild
+from gbserver.storage.stored_lineage_row import TERMINAL, StoredLineageRow
+from gbserver.storage.stored_target_run import StoredTargetRun
+
+logger = logging.getLogger(__name__)
+
+# Marks rows this sink derived, as opposed to rows an importer supplied. A rebuild
+# deletes only derivable rows, so imported lineage survives it -- which matters
+# because imported lineage will not be re-derivable once its upstream sources are
+# switched off.
+SOURCE_SYSTEM = "granite.build"
+
+
+class DBLineageStore(ILineageStore):
+    """Record lineage into the local lineage index.
+
+    Args:
+        storage: the lineage row storage to write. Defaults to the process-wide
+            admin storage, resolved lazily so importing this module does not
+            require a configured database.
+    """
+
+    def __init__(self, storage: Optional[ILineageRowStorage] = None) -> None:
+        self._row_storage = storage
+
+    @property
+    def row_storage(self) -> ILineageRowStorage:
+        """The lineage row storage, resolved on first use."""
+        if self._row_storage is None:
+            from gbserver.storage.singleton_storage import get_admin_storage
+
+            self._row_storage = get_admin_storage().lineage_row_storage
+        return self._row_storage
+
+    # -- Recording -----------------------------------------------------------
+
+    def add_jobstats_for_build(
+        self, storage: SingletonAdminStorage, build_id: str
+    ) -> None:
+        """Record every target of a build.
+
+        Raises:
+            ValueError: if the build does not exist, or has no targets. Both match
+                the W&B sink, so the reconciler sees one behaviour regardless of
+                which sink is configured.
+        """
+        build = self._require_build(storage, build_id)
+        targets = storage.target_storage.get_by_where({"build_id": build_id})
+        if not targets:
+            raise ValueError(f"Zero targets found in build with id {build_id}")
+
+        for target in targets:
+            self._record_target(storage, build, target)
+
+    def add_jobstats_for_build_target(
+        self, storage: SingletonAdminStorage, build_id: str, target_id: str
+    ) -> None:
+        """Record one target of a build -- the single recording leaf.
+
+        Idempotent: re-recording a target that already has rows is a no-op, so the
+        reconciler can call this for an already-recorded target harmlessly.
+
+        Raises:
+            ValueError: if the build or the target does not exist.
+        """
+        build = self._require_build(storage, build_id)
+        targets = storage.target_storage.get_by_where(
+            {"build_id": build_id, "uuid": target_id}
+        )
+        if not targets:
+            raise ValueError(f"Zero targets found in build with id {build_id}")
+
+        for target in targets:
+            self._record_target(storage, build, target)
+
+    def add_jobstats_for_original_artifact(
+        self,
+        artifact: ArtifactRegistration,
+        sources: list[ArtifactRegistration],
+    ) -> None:
+        """Record lineage for a registered artifact and the sources it came from.
+
+        This path has no target run, so the rows carry an empty
+        ``target_run_uuid``; ``build_id`` holds the artifact's uuid instead, which
+        is what the W&B sink also does -- its own comment says the "release_id" for
+        a registered artifact *is* the artifact uuid, and that is the column
+        :meth:`count_release_ids` queries. The ``(job_id, source, target)`` unique
+        still protects against duplicates, so having no target run costs nothing.
+
+        One consequence worth knowing: these rows are never skipped by the
+        presence-based dedup, which keys on ``target_run_uuid``. They do not need
+        to be -- the unique index makes a re-record a no-op -- but they do cost a
+        write attempt each time.
+        """
+        job = self.create_jobstats_for_original_artifact(artifact, sources)
+        if not job:
+            return
+        # build_id carries the artifact uuid so count_release_ids(artifact.uuid)
+        # finds these rows -- the same convention the W&B sink uses, where a
+        # registered artifact's "release_id" IS its uuid.
+        self._write_job(job, build_id=artifact.uuid, target_run_uuid="")
+
+    def _record_target(
+        self,
+        storage: SingletonAdminStorage,
+        build: StoredBuild,
+        target: StoredTargetRun,
+    ) -> None:
+        """Decompose one target run's job entries into rows and store them."""
+        if not isinstance(target, StoredTargetRun):
+            return
+
+        if self.row_storage.has_rows_for_target_run(target.uuid):
+            # Already recorded. Presence, not count: see the module docstring for
+            # why a count comparison would re-record forever.
+            logger.debug("Target run %s already has lineage rows", target.uuid)
+            return
+
+        events, _ = self.create_jobstats_for_target(storage, target, build)
+        for job in events:
+            self._write_job(
+                job, build_id=build.uuid, target_run_uuid=target.uuid
+            )
+
+    def _write_job(
+        self,
+        job: dict,
+        build_id: str,
+        target_run_uuid: str,
+    ) -> None:
+        """Decompose one job entry and add its rows.
+
+        A job that cannot be decomposed is logged and skipped rather than aborting
+        the scan: one unrecordable target must not stop the rest of a build's
+        lineage from landing.
+        """
+        try:
+            drafts = to_lineage_rows(
+                _normalized_job(job), identify=identity_from_artifact_dict
+            )
+        except LineageDecomposeError:
+            logger.warning(
+                "Job entry could not be decomposed into lineage rows; skipping "
+                "(build=%s, target_run=%s)",
+                build_id,
+                target_run_uuid,
+            )
+            return
+
+        for draft in drafts:
+            if draft.source is None and draft.target is None:
+                # Both endpoints unidentifiable: the row would be terminal on both
+                # sides, which identifies nothing and would join unrelated jobs.
+                continue
+            self._add_row(
+                draft,
+                build_id=build_id,
+                target_run_uuid=target_run_uuid,
+            )
+
+    def _add_row(
+        self,
+        draft,
+        build_id: str,
+        target_run_uuid: str,
+    ) -> None:
+        """Store one decomposed row, tolerating the duplicate case.
+
+        The ``(job_id, source, target)`` unique is what makes re-ingest idempotent,
+        so an IntegrityError here is the expected outcome of recording the same
+        lineage twice -- not a failure.
+        """
+        row = _row_from_draft(
+            draft,
+            build_id=build_id,
+            target_run_uuid=target_run_uuid,
+        )
+        try:
+            self.row_storage.add(row)
+        except Exception:
+            logger.debug(
+                "Lineage row already present or could not be added "
+                "(job=%s, source=%r, target=%r)",
+                row.job_id,
+                row.source,
+                row.target,
+            )
+
+    # -- Building (delegated, so both sinks agree on what lineage is) --------
+
+    def create_jobstats_for_target(
+        self,
+        storage: SingletonAdminStorage,
+        targetrun: StoredTargetRun,
+        build: Optional[StoredBuild] = None,
+    ) -> Tuple[List[dict], Dict[str, List[dict]]]:
+        """Build the job entries for a target run.
+
+        Delegates to the shared builder rather than re-deriving, so this sink and
+        the W&B sink cannot disagree about a build's lineage. Only module functions
+        are used, so ``wandb`` is neither imported nor required.
+        """
+        from gbserver.lineage.wandb_jobstats import WandBLineageStore
+
+        # Called unbound with self=None: both builders are pure -- neither touches
+        # self -- so no W&B instance (and no wandb import) is needed. Passing None
+        # rather than binding makes that dependency explicit and fails loudly if a
+        # future edit starts reaching for instance state.
+        return WandBLineageStore._build_events_for_target(
+            None,
+            storage,
+            self._require_build_of(storage, targetrun, build),
+            targetrun,
+        )
+
+    def create_jobstats_for_original_artifact(
+        self,
+        artifact: ArtifactRegistration,
+        sources: list[ArtifactRegistration],
+    ) -> dict:
+        """Build the job entry for a registered artifact. See above for delegation."""
+        from gbserver.lineage.wandb_jobstats import WandBLineageStore
+
+        return WandBLineageStore._build_event_for_artifact(None, artifact, sources)
+
+    # -- Completeness queries -----------------------------------------------
+
+    def count_release_ids(
+        self, release_id: str, target_id: Optional[str] = None
+    ) -> int:
+        """Count the lineage ROWS recorded for a release.
+
+        ``release_id`` is a ``build_id`` for build lineage, and the artifact's uuid
+        for a registered artifact -- the same convention the W&B sink uses, so the
+        same argument works against either.
+
+        **The unit is rows, not W&B runs, and the two numbers differ.** W&B creates
+        one run per (target, output artifact); this sink writes one row per
+        (input, output) pair. A build with 2 inputs and 5 outputs is 5 runs there
+        and 10 rows here. So a caller comparing against a count computed in W&B's
+        shape -- as :meth:`does_release_id_exist` does -- will not match. That is
+        the same shape mismatch that made row-count dedup unusable, which is why
+        recording dedup is presence-based instead.
+
+        Args:
+            release_id: the build uuid, or the artifact uuid.
+            target_id: optional target run to narrow to.
+
+        Returns:
+            How many rows are recorded. ``0`` for an unknown release.
+        """
+        if not release_id:
+            return 0
+        where: dict = {"build_id": release_id}
+        if target_id:
+            where["target_run_uuid"] = target_id
+        return len(self.row_storage.get_by_where(where))
+
+    def does_release_id_exist(
+        self, release_id: str, expected_count: int, target_id: Optional[str] = None
+    ) -> bool:
+        """Whether a release has exactly ``expected_count`` rows recorded.
+
+        Kept for interface compatibility. Mind the unit: ``expected_count`` is
+        compared against a ROW count (see :meth:`count_release_ids`), so a count
+        derived from W&B's one-run-per-output shape will not match here.
+        """
+        return self.count_release_ids(release_id, target_id) == expected_count
+
+    def filter_unrecorded(
+        self,
+        target_ids: set[str],
+        expected_counts: Optional[dict[str, int]] = None,
+        on_query_error: Optional[Callable[[Exception], None]] = None,
+    ) -> set[str]:
+        """Return the candidates that have no rows yet.
+
+        ``expected_counts`` is accepted and **ignored**: it counts one W&B run per
+        output artifact, a shape that never equals an N*M row count, so honouring
+        it would mark every target unrecorded forever. Completeness is by presence
+        instead -- a target's rows are written together, so it either has them or
+        it does not.
+
+        Fails **open**, and invokes ``on_query_error``: on a query failure every
+        candidate is reported unrecorded. Re-recording is idempotent, so that is
+        harmless, and the reconciler is what decides not to record at all (it fails
+        closed on the callback). Without the callback this would silently duplicate
+        work rather than skip it.
+        """
+        if not target_ids:
+            return set()
+        try:
+            recorded = self.row_storage.get_recorded_target_runs(list(target_ids))
+        except Exception as exc:
+            logger.warning("Lineage dedup query failed; treating all as unrecorded")
+            if on_query_error is not None:
+                on_query_error(exc)
+            return set(target_ids)
+        return {target_id for target_id in target_ids if target_id not in recorded}
+
+    # -- Helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _require_build(storage: SingletonAdminStorage, build_id: str) -> StoredBuild:
+        build = storage.build_storage.get_by_uuid(build_id)
+        if build is None:
+            raise ValueError(f"Build with id {build_id} was not found")
+        if not isinstance(build, StoredBuild):
+            raise ValueError(f"Build with id {build_id} was not a build")
+        return build
+
+    def _require_build_of(
+        self,
+        storage: SingletonAdminStorage,
+        targetrun: StoredTargetRun,
+        build: Optional[StoredBuild],
+    ) -> StoredBuild:
+        """Resolve the target's build, validating it matches when one is given."""
+        if build is None:
+            return self._require_build(storage, targetrun.build_id)
+        if targetrun.build_id != build.uuid:
+            raise ValueError(
+                f"target's build id ({targetrun.build_id}) does not match that "
+                f"of the given build ({build.uuid})"
+            )
+        return build
+
+
+def _normalized_job(job: dict) -> dict:
+    """Flatten a jobstats event into the shape ``to_lineage_rows`` expects.
+
+    The shared builders emit an OpenLineage-shaped event: ``sources``/``targets``
+    are mirrored to the top level by ``_add_jobstats_mirror_fields``, but the job
+    identity and its metadata live nested under ``job_details``. Decomposition
+    wants both at the top level, so the nested block is lifted here rather than
+    taught to the decomposer -- which stays independent of the W&B event shape and
+    so remains usable by an importer with its own.
+
+    ``job_details.job_id`` is the target run's uuid for build lineage and the
+    artifact's uuid for a registered artifact, so it is a stable per-execution
+    identity either way -- exactly what the rows of one job must share.
+    """
+    details = job.get("job_details") or {}
+    normalized = {**details, **job}
+    # job_details wins for the identity keys: the top level either lacks them
+    # (job_id) or mirrors the same values.
+    if details.get("job_id"):
+        normalized["job_id"] = details["job_id"]
+    return normalized
+
+
+def _row_from_draft(
+    draft,
+    build_id: str,
+    target_run_uuid: str,
+) -> StoredLineageRow:
+    """Turn a decomposed draft into the stored row.
+
+    ``None`` endpoints become :data:`TERMINAL`, not NULL: in SQL, NULL never equals
+    NULL, so NULL endpoints would slip past the unique index and leave
+    creation/deletion rows as the only ones a re-ingest could duplicate.
+
+    The promoted pieces are parsed back out of the canonical identifier rather than
+    threaded separately, so a column can never disagree with the identifier it
+    describes -- they have one source.
+    """
+    from gbserver.lineage.identity import LineageIdentityError, parse_canonical_id
+
+    def pieces(identifier: Optional[str]) -> dict:
+        if not identifier:
+            return {}
+        try:
+            identity = parse_canonical_id(identifier)
+        except LineageIdentityError:
+            return {}
+        return {
+            "kind": identity.artifact_type.value or "",
+            "namespace": identity.namespace,
+            "name": identity.name,
+            "table": identity.table,
+            "revision": identity.revision,
+        }
+
+    source_pieces = pieces(draft.source)
+    target_pieces = pieces(draft.target)
+
+    return StoredLineageRow(
+        job_id=draft.job_id,
+        source=draft.source or TERMINAL,
+        target=draft.target or TERMINAL,
+        source_uri=draft.source_uri,
+        target_uri=draft.target_uri,
+        source_filter=draft.source_filter,
+        target_filter=draft.target_filter,
+        source_kind=source_pieces.get("kind", ""),
+        source_namespace=source_pieces.get("namespace", ""),
+        source_name=source_pieces.get("name", ""),
+        source_table=source_pieces.get("table", ""),
+        source_revision=source_pieces.get("revision", ""),
+        target_kind=target_pieces.get("kind", ""),
+        target_namespace=target_pieces.get("namespace", ""),
+        target_name=target_pieces.get("name", ""),
+        target_table=target_pieces.get("table", ""),
+        target_revision=target_pieces.get("revision", ""),
+        source_system=SOURCE_SYSTEM,
+        derivable=True,
+        build_id=build_id,
+        target_run_uuid=target_run_uuid,
+        metadata=dict(draft.metadata or {}),
+    )

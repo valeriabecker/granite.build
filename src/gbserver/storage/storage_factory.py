@@ -5,6 +5,7 @@ from gbserver.storage.artifact_registry import IArtifactRegistry
 from gbserver.storage.build_storage import IStoredBuildStorage
 from gbserver.storage.event_storage import IStoredEventStorage
 from gbserver.storage.kv_pair_storage import IKeyValuePairStorage
+from gbserver.storage.lineage_row_storage import ILineageRowStorage
 from gbserver.storage.node_failure_storage import INodeFailureStorage
 from gbserver.storage.space_storage import IStoredSpaceStorage
 from gbserver.storage.space_user_storage import ISpaceUserStorage
@@ -40,6 +41,10 @@ class StorageFactory(abc.ABC):
 
     @abstractmethod
     def create_node_failure_storage(self, table_name: str) -> INodeFailureStorage:
+        raise ValueError("Sub-class must implement")
+
+    @abstractmethod
+    def create_lineage_row_storage(self, table_name: str) -> ILineageRowStorage:
         raise ValueError("Sub-class must implement")
 
     @abstractmethod
