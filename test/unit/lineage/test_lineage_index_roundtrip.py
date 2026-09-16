@@ -217,7 +217,12 @@ class TestOneHop:
 
 
 class TestFanOutRows:
-    """Two inputs and two outputs: the N*M decomposition, end to end."""
+    """Two inputs and two outputs, end to end.
+
+    Proof that the decompose guard does not bite a real target run: the producer
+    emits one event per output artifact, so this arrives as two jobs of 2 sources
+    x 1 target rather than one rejected 2x2 job -- and still lands 4 rows.
+    """
 
     def test_two_by_two_yields_four_rows(self, storage):
         build = add_build(storage)
@@ -239,7 +244,8 @@ class TestFanOutRows:
         rows = storage.lineage_row_storage.get_rows_by_build(build.uuid)
         assert len(rows) == 4
         # One execution, so every row shares the job identity -- which is what
-        # keeps the flattening recoverable.
+        # keeps the flattening recoverable. job_id is the target run's uuid, so
+        # the per-output split does not fragment it.
         assert len({r.job_id for r in rows}) == 1
         assert {r.target_run_uuid for r in rows} == {target.uuid}
 

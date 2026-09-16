@@ -171,9 +171,7 @@ class DBLineageStore(ILineageStore):
 
         events, _ = self.create_jobstats_for_target(storage, target, build)
         for job in events:
-            self._write_job(
-                job, build_id=build.uuid, target_run_uuid=target.uuid
-            )
+            self._write_job(job, build_id=build.uuid, target_run_uuid=target.uuid)
 
     def _write_job(
         self,
@@ -185,18 +183,21 @@ class DBLineageStore(ILineageStore):
 
         A job that cannot be decomposed is logged and skipped rather than aborting
         the scan: one unrecordable target must not stop the rest of a build's
-        lineage from landing.
+        lineage from landing. The reason is logged with it -- a bare "skipping"
+        makes lineage loss undiagnosable, and lineage this index misses is not
+        re-derivable once the upstream sources are switched off.
         """
         try:
             drafts = to_lineage_rows(
                 _normalized_job(job), identify=identity_from_artifact_dict
             )
-        except LineageDecomposeError:
+        except LineageDecomposeError as exc:
             logger.warning(
                 "Job entry could not be decomposed into lineage rows; skipping "
-                "(build=%s, target_run=%s)",
+                "(build=%s, target_run=%s): %s",
                 build_id,
                 target_run_uuid,
+                exc,
             )
             return
 

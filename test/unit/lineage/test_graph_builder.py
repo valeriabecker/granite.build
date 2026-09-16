@@ -89,8 +89,10 @@ class TestBipartiteShape:
 
 class TestJobRegrouping:
     def test_n_by_m_rows_converge_on_one_run_node(self):
-        # The N*M decomposition reassembled: 2 inputs x 2 outputs is 4 rows, but
-        # one execution, so one run node with 2 in and 2 out.
+        # 2 inputs x 2 outputs is 4 rows, but one execution, so one run node with
+        # 2 in and 2 out. Rows are built directly: the decompose guard rejects a
+        # single 2x2 job, while a real target run reaches this shape as two
+        # per-output jobs sharing one job_id (test_lineage_index_roundtrip).
         rows = [
             row("J1", "table:prod/ns::i1", "table:prod/ns::o1"),
             row("J1", "table:prod/ns::i1", "table:prod/ns::o2"),

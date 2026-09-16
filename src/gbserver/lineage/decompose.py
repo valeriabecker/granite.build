@@ -18,10 +18,13 @@
 
 One job execution becomes a set of ``(source, job_id, target)`` triples. The
 ``job_id`` on every row is what keeps the decomposition lossless: a job with N
-inputs and M outputs emits N*M rows, and grouping those rows back by ``job_id``
-recovers the original input and output sets. Without it the flattening would
-dissolve the grouping, and "each input produced each output" would be an
-unrecoverable claim rather than a projection.
+inputs and one output (or one input and M outputs) emits max(N, M) rows, and
+grouping those rows back by ``job_id`` recovers the original input and output
+sets. Without it the flattening would dissolve the grouping, and "each input
+produced each output" would be an unrecoverable claim rather than a projection.
+
+The guard in :func:`to_lineage_rows` keeps a job from having more than one of
+both, so the pairing is never a true cartesian product.
 
 This is deliberately generic -- the input is a plain dict, not a granite.build
 type -- because the same function serves the build sink and the future importers
@@ -29,8 +32,8 @@ of Lakehouse/dmf-ng/W&B lineage. Nothing here imports storage or granite.build
 models.
 
 Ported from ``prototype-lineage-py`` (``lineage/decompose.py``, in turn
-``NewStatsInput.getLineageRecords``), with its N*M guard deliberately dropped --
-see :func:`to_lineage_rows`.
+``NewStatsInput.getLineageRecords``), including its N*M guard -- see
+:func:`to_lineage_rows`.
 """
 
 from typing import Any, Optional
@@ -72,7 +75,7 @@ class LineageRowDraft:
 
     Attributes:
         job_id: identity of the job execution; the same value on every row of one
-            job, and what makes the N*M decomposition regroupable.
+            job, and what makes the decomposition regroupable.
         source: canonical identifier of the input artifact, or ``None`` (creation).
         target: canonical identifier of the output artifact, or ``None`` (deletion).
         source_uri: the input artifact's real URI, verbatim from the artifact dict,
@@ -200,19 +203,34 @@ def to_lineage_rows(
             translation.
 
     Returns:
-        The rows, in a deterministic order: by source then target as given. A job
-        with N sources and M targets yields N*M rows, all sharing ``job_id``.
+        The rows, in a deterministic order: by source then target as given. By the
+        guard one side is at most one, so a job yields max(N, M) rows, all sharing
+        ``job_id``.
 
     Raises:
-        LineageDecomposeError: if ``job_id`` is missing or empty, or if the job has
-            neither sources nor targets (there is no lineage to record).
+        LineageDecomposeError: if ``job_id`` is missing or empty, if the job has
+            neither sources nor targets (there is no lineage to record), or if it
+            has more than one of both (see the guard below).
 
-    The prototype's guard is **not** ported. It rejects ``len(sources) > 1 and
-    len(targets) > 1`` outright, but granite.build produces exactly that
-    routinely -- a target run with 3 inputs and 2 outputs -- and the W&B sink
-    already handles it without error today. Rejecting it would drop real lineage.
-    N*M does not invent provenance here because ``job_id`` is on every row, so the
-    original grouping stays recoverable.
+    Ported from the prototype: a job with ``len(sources) > 1 and
+    len(targets) > 1`` is rejected, so every accepted job -- and therefore every
+    stored row -- satisfies ``min(#sources, #targets) <= 1``.
+
+    granite.build's own producers already satisfy this, because ``wandb_jobstats``
+    emits one event per output artifact rather than one per target run. The guard
+    is here for the generic entry point: an importer with genuinely N*M records
+    must split them into one job per target before calling this, keeping a
+    distinct job identity per piece, rather than relax the guard.
+
+    Do NOT make this function auto-split such a job to avoid raising. That was
+    tried and reverted, because it trades a visible refusal for a silently wrong
+    graph: the run node is derived from ``job_id``
+    (``graph_builder.py``, :func:`_run_node_id`), so giving the pieces distinct
+    ids makes ONE execution render as TWO run nodes, and nothing in a row can put
+    them back together. The edges survive but the execution does not, which is a
+    worse failure than the caller getting an error it can act on. A caller holding
+    an N*M record must decide how to attribute it -- this function cannot decide
+    for it without inventing provenance.
     """
     job_id = job.get("job_id") or ""
     if not job_id:
@@ -226,6 +244,11 @@ def to_lineage_rows(
     if not sources and not targets:
         raise LineageDecomposeError(
             f"job {job_id!r} has neither sources nor targets; nothing to record"
+        )
+    if len(sources) > 1 and len(targets) > 1:
+        raise LineageDecomposeError(
+            f"job {job_id!r}: too many sources {len(sources)} and targets "
+            f"{len(targets)}; split it into one job per target"
         )
 
     metadata = _job_metadata(job)
@@ -255,17 +278,21 @@ def to_lineage_rows(
     if not sources:
         return [draft(None, target) for target in targets]
 
-    # The general case, which subsumes the prototype's 2b (N sources, 1 target)
-    # and 3 (1 source, M targets) without special-casing either.
+    # The remaining shapes: N sources x 1 target (the prototype's 2b) and
+    # 1 source x M targets (its 3). The guard above rules out N*M with both
+    # sides > 1, so this comprehension emits max(N, M) rows, never a true
+    # cartesian product -- but it still covers both without special-casing.
     return [draft(source, target) for source in sources for target in targets]
 
 
 def group_by_job(rows: list[LineageRowDraft]) -> dict[str, dict[str, set]]:
     """Recover each job's input and output sets from decomposed rows.
 
-    The inverse of the N*M flattening, and the reason dropping the prototype's
-    guard is safe: the rows of one job still say which inputs and which outputs
-    that execution had, so the flat pairing is a projection rather than a loss.
+    The inverse of the flattening: the rows of one job still say which inputs and
+    which outputs that execution had, so the flat pairing is a projection rather
+    than a loss. This holds independently of the guard -- it is what makes the
+    fan-out shapes the guard *does* accept (N sources x 1 target, 1 source x M
+    targets) safe to store flat.
 
     Args:
         rows: decomposed rows, from any number of jobs.

@@ -100,73 +100,94 @@ class TestFanShapes:
 
 
 class TestCartesianCase:
-    """N sources AND M targets -- what the prototype rejects outright.
+    """N sources AND M targets -- rejected, as in the prototype.
 
-    Its guard raises when ``len(sources) > 1 and len(targets) > 1``, but a
-    granite.build target run with 3 inputs and 2 outputs is routine, and the W&B
-    sink already records it today. Rejecting it would drop real lineage.
+    The guard raises when ``len(sources) > 1 and len(targets) > 1``, so every
+    accepted job has ``min(#sources, #targets) <= 1``. No granite.build producer
+    can build such a job: ``wandb_jobstats`` emits one event per output artifact,
+    so a target run with 3 inputs and 2 outputs arrives as two jobs of 3 sources
+    x 1 target, never as one 3x2 job.
     """
 
-    def test_three_inputs_two_outputs_emits_six_rows(self):
-        rows = to_lineage_rows(
-            job(
-                sources=[artifact("i1"), artifact("i2"), artifact("i3")],
-                targets=[artifact("o1"), artifact("o2")],
-            ),
-            identify,
-        )
-        assert len(rows) == 6
-        assert pairs(rows) == [
-            ("i1", "o1"),
-            ("i1", "o2"),
-            ("i2", "o1"),
-            ("i2", "o2"),
-            ("i3", "o1"),
-            ("i3", "o2"),
-        ]
+    def test_three_inputs_two_outputs_raises(self):
+        with pytest.raises(LineageDecomposeError, match="too many sources 3"):
+            to_lineage_rows(
+                job(
+                    sources=[artifact("i1"), artifact("i2"), artifact("i3")],
+                    targets=[artifact("o1"), artifact("o2")],
+                ),
+                identify,
+            )
 
-    def test_does_not_raise(self):
-        """The one behavioral divergence from the prototype, stated as a test."""
-        rows = to_lineage_rows(
-            job(
-                sources=[artifact("a"), artifact("b")],
-                targets=[artifact("x"), artifact("y")],
-            ),
-            identify,
-        )
-        assert len(rows) == 4
+    def test_two_by_two_raises(self):
+        with pytest.raises(LineageDecomposeError, match="too many sources 2"):
+            to_lineage_rows(
+                job(
+                    sources=[artifact("a"), artifact("b")],
+                    targets=[artifact("x"), artifact("y")],
+                ),
+                identify,
+            )
 
-    def test_every_row_shares_the_job_id(self):
-        rows = to_lineage_rows(
+    def test_fan_out_on_one_side_is_accepted(self):
+        """The guard bounds only the both-sides case; either fan-out is fine."""
+        many_sources = to_lineage_rows(
             job(
                 job_id="run-7",
                 sources=[artifact("a"), artifact("b")],
+                targets=[artifact("x")],
+            ),
+            identify,
+        )
+        assert pairs(many_sources) == [("a", "x"), ("b", "x")]
+        assert {row.job_id for row in many_sources} == {"run-7"}
+
+        many_targets = to_lineage_rows(
+            job(
+                job_id="run-8",
+                sources=[artifact("a")],
                 targets=[artifact("x"), artifact("y")],
             ),
             identify,
         )
-        assert {row.job_id for row in rows} == {"run-7"}
+        assert pairs(many_targets) == [("a", "x"), ("a", "y")]
+        assert {row.job_id for row in many_targets} == {"run-8"}
 
 
 class TestRegrouping:
-    """Why N*M is a projection and not a loss of information.
+    """Why the flattening is a projection and not a loss of information.
 
-    This is the property that justifies dropping the guard: the flat rows still
-    say which inputs and which outputs one execution had.
+    The flat rows still say which inputs and which outputs one execution had,
+    which is what makes the fan-out shapes the guard accepts safe to store flat.
     """
 
     def test_inputs_and_outputs_are_recoverable(self):
+        """A 3-input target run, in the two per-output jobs a producer emits.
+
+        The guard rejects a single 3x2 job, so this is the shape that actually
+        reaches storage -- and both outputs still regroup to the same three
+        inputs, because ``job_id`` is shared across each job's rows.
+        """
         rows = to_lineage_rows(
             job(
                 job_id="J",
                 sources=[artifact("i1"), artifact("i2"), artifact("i3")],
-                targets=[artifact("o1"), artifact("o2")],
+                targets=[artifact("o1")],
+            ),
+            identify,
+        ) + to_lineage_rows(
+            job(
+                job_id="J2",
+                sources=[artifact("i1"), artifact("i2"), artifact("i3")],
+                targets=[artifact("o2")],
             ),
             identify,
         )
         grouped = group_by_job(rows)
         assert grouped["J"]["sources"] == {"i1", "i2", "i3"}
-        assert grouped["J"]["targets"] == {"o1", "o2"}
+        assert grouped["J"]["targets"] == {"o1"}
+        assert grouped["J2"]["sources"] == {"i1", "i2", "i3"}
+        assert grouped["J2"]["targets"] == {"o2"}
 
     def test_terminals_regroup_without_none(self):
         creation = to_lineage_rows(job("C", targets=[artifact("o")]), identify)
@@ -314,8 +335,8 @@ class TestRowIdentity:
     def test_rows_of_one_job_have_distinct_keys(self):
         rows = to_lineage_rows(
             job(
-                sources=[artifact("a"), artifact("b")],
-                targets=[artifact("x"), artifact("y")],
+                sources=[artifact("a"), artifact("b"), artifact("c")],
+                targets=[artifact("x")],
             ),
             identify,
         )

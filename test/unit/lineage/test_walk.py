@@ -387,7 +387,13 @@ class TestCrossCheckAgainstReference:
         assert graph.depths == ref_depths
 
     def test_matches_reference_on_a_cartesian_job(self):
-        """The N*M shape the prototype rejects outright."""
+        """A true N*M row set, which the traversal must still handle.
+
+        ``to_lineage_rows`` now rejects such a job, so granite.build will not
+        write this shape -- but the walk reads rows, not jobs, and an importer or
+        rows predating the guard can still present it. Built directly for that
+        reason.
+        """
         rows = [
             row("J", src, tgt) for src in ("i1", "i2", "i3") for tgt in ("o1", "o2")
         ]

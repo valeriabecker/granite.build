@@ -68,7 +68,7 @@ LH_MODEL = "lh://prod/ns/models/mdl_tbl/trained/v1"
 
 
 class TestDecomposition:
-    """One job entry becomes N*M rows sharing a job_id."""
+    """One job entry becomes max(N, M) rows sharing a job_id."""
 
     def test_one_input_one_output_is_one_row(self, sink, rows):
         sink._write_job(
@@ -78,21 +78,47 @@ class TestDecomposition:
         )
         assert len(rows.get_rows_by_job("J1")) == 1
 
-    def test_two_by_three_is_six_rows(self, sink, rows):
+    def test_two_inputs_one_output_is_two_rows(self, sink, rows):
         sink._write_job(
             job(
                 "J1",
                 [artifact("i1", LH_TABLE), artifact("i2", "s3://b/i2")],
-                [
-                    artifact("o1", LH_MODEL),
-                    artifact("o2", "s3://b/o2"),
-                    artifact("o3", "s3://b/o3"),
-                ],
+                [artifact("o1", LH_MODEL)],
             ),
             build_id="BLD",
             target_run_uuid="TR",
         )
-        assert len(rows.get_rows_by_job("J1")) == 6
+        assert len(rows.get_rows_by_job("J1")) == 2
+
+    def test_many_inputs_and_many_outputs_records_nothing(self, sink, rows):
+        """The guard refuses this job, and _write_job skips rather than raises.
+
+        No producer emits the shape -- wandb_jobstats writes one event per output
+        artifact -- so reaching it means a malformed entry, and one such entry must
+        not abort the rest of a build's scan. Splitting it into one job per target
+        would keep the edges but fragment the run: the graph builder derives its run
+        node from job_id (graph_builder.py:223), so one execution would render as
+        two run nodes. Refusing is the honest outcome; the warning carries the
+        reason so the loss is diagnosable.
+        """
+        sink._write_job(
+            job(
+                "J1",
+                [artifact("i1", LH_TABLE), artifact("i2", "s3://b/i2")],
+                [artifact("o1", LH_MODEL), artifact("o2", "s3://b/o2")],
+            ),
+            build_id="BLD",
+            target_run_uuid="TR",
+        )
+        assert rows.get_rows_by_build("BLD") == []
+
+    def test_a_malformed_job_is_skipped_not_raised(self, sink, rows):
+        """A job the guard cannot rescue is logged and skipped, not fatal.
+
+        One unrecordable entry must not abort the rest of a build's scan.
+        """
+        sink._write_job(job("J1", [], []), build_id="BLD", target_run_uuid="TR")
+        assert rows.get_rows_by_build("BLD") == []
 
     def test_every_row_of_a_job_shares_its_job_id(self, sink, rows):
         sink._write_job(
@@ -175,8 +201,9 @@ class TestDedupByPresence:
         assert sink.filter_unrecorded({"t1", "t2"}) == {"t2"}
 
     def test_expected_counts_is_ignored(self, sink):
-        # It counts one W&B run per output artifact -- a shape that never equals an
-        # N*M row count. Honouring it would report every target unrecorded forever.
+        # It counts one W&B run per output artifact -- a shape that need not equal
+        # this sink's row count, since one such event still fans out over its
+        # inputs. Honouring it would report every target unrecorded forever.
         sink._write_job(
             job("J1", [artifact("a", LH_TABLE)], [artifact("b", LH_MODEL)]),
             build_id="BLD",
