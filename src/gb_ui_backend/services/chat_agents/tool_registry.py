@@ -17,9 +17,15 @@ import inspect
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
-from mcp import ClientSession
+# Import-time optional: `mcp` ships with the top-level granite.build distribution's
+# [chat] extra, but not with granite-build-analytics, where chat runs on the
+# dashboard tools alone (see tool_loop_backend._gbmcp_available). ClientSession is
+# only referenced in annotations on the two gbmcp-only builders below, and
+# `from __future__ import annotations` means those are never evaluated at runtime.
+if TYPE_CHECKING:
+    from mcp import ClientSession
 
 from gb_ui_backend.config import Config
 from gb_ui_backend.services.chat_agents import dashboard_tools
@@ -368,10 +374,21 @@ def _wrap(
     )
 
 
-def build_dashboard_tools(config: Config) -> list[ToolSpec]:
+def build_dashboard_tools(
+    config: Config, *, gbmcp_available: bool = True
+) -> list[ToolSpec]:
     """Ports the same tool descriptions/schemas used previously — already
     framework-agnostic, just re-declared as ToolSpecs instead of via a
-    Claude-Agent-SDK-specific @tool decorator."""
+    Claude-Agent-SDK-specific @tool decorator.
+
+    `gbmcp_available` gates the cross-references these descriptions make to gbmcp
+    tools (`build_status`/`build_describe`/`build_log`). Descriptions go to the model
+    just as the system prompt does, so pointing at a tool that isn't in this
+    deployment's tool list has the same failure mode _build_system_prompt() guards
+    against: the model announces a capability it has no tool for, then confabulates
+    a result. Only the cross-reference clauses vary — names, schemas and handlers are
+    identical either way.
+    """
     specs = [
         _wrap(
             "search_docs",
@@ -393,7 +410,14 @@ def build_dashboard_tools(config: Config) -> list[ToolSpec]:
         _wrap(
             "search_builds",
             "Search/filter builds by text, status, user, space, and/or date range. Use this for "
-            "anything bulk or filtered; use build_status/build_describe for a single known build ID.",
+            + (
+                "anything bulk or filtered; use build_status/build_describe for a single known build ID."
+                if gbmcp_available
+                # No substitute pointer here: `query` matches build *name* only (see
+                # dashboard_tools.search_builds), so it is not a build-ID lookup, and
+                # this deployment has no single-build tool to redirect to.
+                else "anything bulk or filtered."
+            ),
             {
                 "type": "object",
                 "properties": {
@@ -527,8 +551,13 @@ def build_dashboard_tools(config: Config) -> list[ToolSpec]:
         specs.append(
             _wrap(
                 "search_build_logs",
-                "Search a build's logs for a substring across its recent history. Prefer this over "
-                "build_log when the user wants to search, not just see the latest log.",
+                "Search a build's logs for a substring across its recent history."
+                + (
+                    " Prefer this over build_log when the user wants to search, not just see "
+                    "the latest log."
+                    if gbmcp_available
+                    else ""
+                ),
                 {
                     "type": "object",
                     "properties": {

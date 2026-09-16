@@ -226,8 +226,11 @@ config:
         - my_dockerconfig_secret    # Secret name whose value is a dockerconfigjson; creates an image
                                     # pull secret in the namespace.
       secret_names_to_use_as_env_variable:
-        - env_name: HF_TOKEN        # Env var injected into the pod.
-          secret_name: huggingface_token  # Space secret to read; falls back to env_name.lower().
+        - env_name: HF_TOKEN        # Env var injected into the pod via secretKeyRef (the kubelet
+                                    # mounts the value; the build server never resolves it). The pod
+                                    # env-var name is the verbatim env_name (portable with LSF/SkyPilot).
+          secret_name: huggingface_token  # Space secret name; the Secret data-key defaults to the
+                                    # lowercased env_name (here hf_token) when omitted.
     app_wrapper_config:
       warmupGracePeriodDuration: 30m  # Passed through to the Helm chart values.
       retryLimit: 2
@@ -239,6 +242,22 @@ config:
                                         # existing PriorityClass in the cluster.
                                         # Unset = cluster default.
 ```
+
+The implicit input-pull and output-push steps a target injects (e.g. `hfpull`, `hfpush`,
+`lhpull`, `s3push`) are synthesized by the server and do not carry a step `config`, so they
+do not read `priority_class_name` directly. Instead they inherit the target's *effective*
+priority: the minimum across the target's explicit steps, where `default-priority` (also the
+value when a step leaves it unset) ranks below `high-priority`. So a pull/push pod is given
+`high-priority` only when **every** explicit step in the target is `high-priority`; if any
+step is `default-priority` or unset, the pull/push pods stay at the cluster default — an
+artifact transfer never outranks the workload it serves.
+
+Only `default-priority` and `high-priority` are ordered; any other name is treated as the
+floor. This is a deliberate design choice: rather than query the cluster's `PriorityClass`
+objects to resolve arbitrary names to their numeric `value`, the ranking hard-codes just
+these two. In practice those are the only classes these builds use, so the simpler,
+dependency-free comparison suffices and avoids a cluster API call, caching, and a
+fallback path. Extend the ranking here if a third class is ever needed.
 
 `compute_config.num_gpus_per_node` / `total_memory_per_node` are translated into pod resource specs by
 the Helm chart values.

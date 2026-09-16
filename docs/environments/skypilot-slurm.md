@@ -78,9 +78,47 @@ whichever layer is most convenient:
 
 This precedence is implemented in `Skypilot._resolve_infra_and_zone` and applies to the HPC
 clouds (`slurm` and `lsf` — see [skypilot-lsf.md](skypilot-lsf.md); non-HPC clouds consult only
-the step launcher's `resources`). For a real-cluster example, see the
-[`skypilot/slurm/ibm-bluevela`](../../configurations/assets/environments/skypilot/slurm/ibm-bluevela/environment.yaml)
-environment (BlueVela's `gpu-mid` partition, reached at `login1`).
+the step launcher's `resources`). For a real-cluster example, the SLURM/BlueVela integration
+fixtures under `test-data/integration/ibm/buildrunner/skypilot/slurm_bluevela/` target BlueVela's
+`gpu-mid` partition (reached at `login1`) via the `bluevela` environment.
+
+> **The `bluevela` environment lives in a remote space, not this repo.** Those fixtures resolve
+> `space://environments/skypilot/slurm/bluevela` against a remote space (e.g. `gb-test`), which is
+> why `bluevela` isn't found anywhere in this tree. That environment sets `cluster: bluevela`,
+> `zone: gpu-mid`, a shared `shared_workdir`, and the `cloud_config` workdir mapping described
+> below, and authenticates to the SLURM login node with an SSH key (an on-host
+> `~/.ssh/ibm-bluevela.key`, or a `BV_SSH_PRIVATE_KEY` secret in the space).
+
+#### Override the partition (`zone`) per build
+
+To run a target on a different partition than its environment declares, set `zone` in the build's
+step `config` — no `environment.yaml` change needed. Either build-level layer above works. Because a
+`zone` without a `cluster` is rejected (see above), also supply a `cluster` unless the environment
+already sets one (it does for `bluevela`).
+
+Layer 2 — under `launcher_config.resources` (wins over a top-level `zone`):
+
+```yaml
+# build.yaml
+targets:
+  my-target:
+    environment_uri: space://environments/skypilot/slurm/bluevela
+    steps:
+      - step_uri: space://steps/command
+        config:
+          launcher_config:
+            resources:
+              zone: gpu-high        # override the env's gpu-mid partition
+              # cluster: bluevela   # only if the environment doesn't already set one
+```
+
+Layer 3 — a plain top-level `zone` in the step `config` (shorter; overridden by any
+`launcher_config.resources.zone`):
+
+```yaml
+        config:
+          zone: gpu-high            # override the partition
+```
 
 ### Autostop is ignored
 
@@ -94,6 +132,64 @@ the surplus stay PENDING until earlier ones finish and free a node.
 Setting `image_id` on a launcher runs the job in a container, which on SLURM **requires the Pyxis SPANK
 plugin**. On a bare-host SLURM cluster (including the local Docker fixture), omit `image_id` or the
 launch fails with `NotSupportedError`; the `run:` command then executes directly on the compute node.
+
+> **Container images must be Debian/Ubuntu-based (apt).** When running in a container, SkyPilot
+> bootstraps its in-container SSH shim with `apt-get`, so only Debian-based images are supported (see
+> the SkyPilot [Docker containers docs](https://docs.skypilot.ai/en/latest/examples/docker-containers.html)).
+> A non-Debian image (e.g. a Fedora/RPM `quay.io/fedora/...` image) pulls fine but fails during job
+> setup — enroot launches it, the `apt-get` step exits non-zero, and the failure surfaces only as a
+> generic `ResourcesUnavailableError: Failed to acquire resources in <partition>`. Confirm with
+> `sacct -j <job_id> --format=JobID,State,ExitCode,Reason`: the container-setup sub-steps show
+> `FAILED 1:0` while the host-side steps complete. The image must also grant passwordless `sudo` (or run
+> as root).
+
+### `workdir` (containerized steps)
+
+A containerized step (`command_config.image` set) runs its `run:` inside an enroot container whose
+filesystem is **not** the compute node's. The SkyPilot SLURM backend bind-mounts only three host paths
+into that container — the account home, the ccache dir, and the SkyPilot **`workdir`**
+([`sky/provision/slurm/instance.py`](https://github.com/cmadam/skypilot/blob/5f18669dc9985f0649147dbcc6bb79d89aeb428d/sky/provision/slurm/instance.py)
+in the granite-build SkyPilot fork pinned by `pyproject.toml`
+builds `--container-mounts` as `home:home`, `ccache:ccache`, and `workdir:workdir`, the last only when
+`workdir` is set and differs from home). It does **not** identity-mount `/proj` (that is the LSF
+backend, not this one). So unless `shared_workdir` falls under a mounted path, the per-run
+`$GB_BUILD_WORKDIR` does not exist inside the container: the launcher's `cd "$GB_BUILD_WORKDIR"`
+`mkdir`s it in the container's ephemeral writable overlay, the step writes its output there, the overlay
+is discarded at teardown, and the separate bare `hfpush` step then fails with `out does not exist` (or
+`<path> does not exist`).
+
+**Fix:** set the SkyPilot `workdir` to an ancestor of (or equal to) `shared_workdir` via the
+environment's `cloud_config` block, which is deep-merged into `~/.sky/config.yaml` at launch. The key
+path is `slurm.cluster_configs.<cluster>.workdir` (`<cluster>` is the `cluster:` name):
+
+```yaml
+config:
+  shared_workdir: /proj/data-eng/llmb-read-write/builds/
+  cloud_config:
+    slurm:
+      cluster_configs:
+        bluevela:                                    # must match config.cluster
+          workdir: /proj/data-eng/llmb-read-write/builds   # ancestor of shared_workdir
+```
+
+With this, the enroot container mounts `/proj/data-eng/llmb-read-write/builds` identity, the container's
+`cd "$GB_BUILD_WORKDIR"` lands on the real shared filesystem, and a relative output path (e.g. `out/`)
+is visible to the downstream `hfpush`. No `build.yaml` change is needed.
+
+Constraints and notes:
+
+- **`workdir` must be an ancestor of (or equal to) `shared_workdir`** so the derived
+  `$GB_BUILD_WORKDIR = <shared_workdir>/builds/<build_id>/runs/<targetrun_id>/` falls inside the
+  `workdir:workdir` bind mount.
+- **`workdir` must not equal the account home** (`remote_home_dir`); when it does, the backend adds no
+  extra mount and the fix is inert.
+- **Bare steps don't need this** — they run on the host and see `shared_workdir` directly. `workdir` is
+  only required once a step runs in a container.
+- **Side effect:** SkyPilot relocates its cluster home to `<workdir>/.sky_clusters/<cluster>`. This is
+  benign and does not collide with gbserver's `<shared_workdir>/builds/...` run tree.
+- This mirrors LSF's `cloud_config.lsf.cluster_configs.<cluster>.workdir`, but LSF does **not** require
+  the ancestor relationship because its backend identity-mounts all of `/proj` (see
+  [skypilot-lsf.md](skypilot-lsf.md#file_mounts-inside-enroot-containers)).
 
 ## Example `environment.yaml` (bare-host SLURM)
 
@@ -152,24 +248,15 @@ environment_configs:
           run: |
             {{ config.command_config.command }}
     monitors:
+      # References the shipped monitor library (builtins/monitors/skypilot) as-is —
+      # no inline event rules to maintain. It carries the standard GB_ARTIFACT_*
+      # convention (GB_ markers, with the legacy LLMB_ prefix dual-accepted, and the
+      # `binding` field) plus the default poll/log_retrieval profile; a build.yaml step
+      # `config.poll_interval_seconds` flows through the monitor's own `| default(...)`
+      # template (see the `command` step at
+      # src/gbserver/builtins/steps/skypilot/command/step.yaml).
       skypilot_monitor:
-        type: skypilot_monitor
-        config:
-          poll_interval_seconds: 5
-          event_configs:
-            # Markers standardized on GB_; the legacy LLMB_ prefix is dual-accepted.
-            - event_type: NEWARTIFACT_IN_ENVIRONMENT_EVENT
-              line_regex: "(?:GB_|LLMB_)ARTIFACT_ID:.* (?:GB_|LLMB_)ARTIFACT_PATH:.*"
-              is_json: false
-              event_fields:
-                - field_name: binding_id
-                  field_regex: "(?:(?<=GB_ARTIFACT_ID:)|(?<=LLMB_ARTIFACT_ID:))[^ ]+"
-                - field_name: path
-                  field_regex: "(?:(?<=GB_ARTIFACT_PATH:)|(?<=LLMB_ARTIFACT_PATH:)).*"
-                  is_data: true
-                - field_name: binding
-                  field_value_template: '{ "path": "{{ fields.data.path }}" }'
-                  is_json: true
+        ref: space://monitors/skypilot
 ```
 
 ## See also

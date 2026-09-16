@@ -37,11 +37,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gbserver.monitoring.lsf_bsub_monitor import (
+    _FAILURE_LOG_TAIL_MAX_BYTES,
     LSF_ACTIVE_STATE_TO_GB_STATUS,
     LSF_STATE_CLASS,
     BJobRecord,
     LSFBsubMonitor,
     LsfStateClass,
+    _sanitize_log_tail,
 )
 from gbserver.resilience.retry_handler import RetryHandler
 from gbserver.types.buildevent import (
@@ -123,8 +125,10 @@ def _make_monitor(
         stop_event=stop_event,
         monitor_interval=MONITOR_INTERVAL,
     )
-    # Never let a test reach out to a cluster for the transient-error probe.
+    # Never let a test reach out to a cluster for the transient-error probe or
+    # the failure log-tail read (both are best-effort SSH reads).
     monitor._check_for_transient_lsf_error = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    monitor._read_log_tail = AsyncMock(return_value=None)  # type: ignore[method-assign]
     return monitor, queue, commands
 
 
@@ -292,6 +296,67 @@ async def test_exit_reason_is_surfaced_in_the_failure_message():
     joined = "\n".join(msgs)
     assert "137" in joined
     assert "TERM_MEMLIMIT" in joined
+
+
+@pytest.mark.asyncio
+async def test_workload_log_tail_is_attached_to_the_failure_message():
+    """The terminal failure event should carry the workload's own error (the log
+    tail), not just LSF's scheduler-level exit reason."""
+    monitor, queue, _ = _make_monitor(
+        [_bjobs_json("RUN"), _bjobs_json("EXIT", exit_code="1")]
+    )
+    monitor._read_log_tail = AsyncMock(  # type: ignore[method-assign]
+        return_value="RuntimeError: Engine core initialization failed.",
+    )
+    await _drive(monitor, expect_terminates=True)
+    msgs = _msgs(queue)
+    assert _has_terminal_failure(msgs)
+    joined = "\n".join(msgs)
+    assert "Last log lines:" in joined
+    assert "RuntimeError: Engine core initialization failed." in joined
+
+
+@pytest.mark.asyncio
+async def test_read_log_tail_is_bounded_and_never_hangs():
+    """The tail read sits on the failure-emission path, so a wedged SSH must not
+    block it: a stuck read is abandoned (returns None) within the timeout, not
+    awaited forever."""
+    monitor, _, _ = _make_monitor([_bjobs_json("RUN")])
+    # _make_monitor stubs _read_log_tail; restore the real one under test.
+    monitor._read_log_tail = types.MethodType(  # type: ignore[method-assign]
+        LSFBsubMonitor._read_log_tail, monitor
+    )
+
+    async def _hang(_cmd):  # noqa: ANN001 - never completes
+        await asyncio.Event().wait()
+
+    monitor._run_log_tail_cmd = _hang  # type: ignore[method-assign]
+    with patch(
+        "gbserver.monitoring.lsf_bsub_monitor._FAILURE_LOG_TAIL_TIMEOUT_S", 0.05
+    ):
+        result = await asyncio.wait_for(
+            monitor._read_log_tail("/tmp/job.log", 40), timeout=5
+        )
+    assert result is None
+
+
+def test_sanitize_log_tail_caps_bytes_and_neutralizes_fences():
+    """The attached tail is display-only, but rides into the PR markdown: cap its
+    width and defuse triple-backticks so it can't break the code fence."""
+    assert _sanitize_log_tail(None) is None
+    assert _sanitize_log_tail("") is None
+
+    # A stray ``` in remote content must not survive to break the fence.
+    assert "```" not in _sanitize_log_tail("boom ``` still going")
+
+    # Oversized input is capped (keeping the tail) and marked truncated.
+    huge = "A" * (_FAILURE_LOG_TAIL_MAX_BYTES * 2) + "REAL_ERROR_AT_END"
+    out = _sanitize_log_tail(huge)
+    assert len(out.encode("utf-8")) <= _FAILURE_LOG_TAIL_MAX_BYTES + len(
+        "...[truncated]...\n"
+    )
+    assert "REAL_ERROR_AT_END" in out
+    assert "truncated" in out
 
 
 # ---------------------------------------------------------------------------

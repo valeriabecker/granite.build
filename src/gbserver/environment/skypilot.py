@@ -11,6 +11,7 @@ import concurrent.futures
 import functools
 import glob
 import os
+import re
 import shlex
 import stat
 import threading
@@ -47,6 +48,8 @@ from gbserver.spaces.hf_push_config import (
 )
 from gbserver.types.buildconfig import BuildTargetStepConfig
 from gbserver.types.buildevent import EntityRunMetadata
+from gbserver.types.environment.environment import EnvironmentVariableConfig
+from gbserver.types.environment.skypilot import StepSkypilotConfig
 from gbserver.types.environmentconfig import EnvironmentConfig
 from gbserver.types.errors import (
     ErrSkypilotInteractiveAuthFailed,
@@ -67,6 +70,26 @@ if HAS_SKYPILOT:
     import sky.exceptions
 else:
     sky = None  # type: ignore[assignment]
+
+
+def _get_step_skypilot_config(config: Optional[Dict]) -> StepSkypilotConfig:
+    """Parse the step's ``config.skypilot`` section into a typed model.
+
+    Mirrors ``K8s._get_step_env_config``: reads the per-cloud step-config
+    section (``config.skypilot`` / ``config.Skypilot``) so declared secrets and
+    other skypilot-specific step settings are validated. Extra keys are ignored,
+    and a missing section yields an empty default. Module-level so both the
+    unmanaged ``Skypilot`` launcher and the ``Skypilot_managed`` job launcher can
+    share it.
+
+    :param config: the full step config dict (may be None).
+    :returns: the parsed ``StepSkypilotConfig`` (empty default if absent).
+    """
+    sky_dict = (config.get("skypilot") or config.get("Skypilot")) if config else None
+    if not sky_dict:
+        return StepSkypilotConfig()
+    return StepSkypilotConfig(**sky_dict)
+
 
 _DEFAULT_POLL_INTERVAL_SECONDS = 300
 
@@ -969,6 +992,9 @@ class Skypilot(Environment):
         # uniquely-named cluster instead of reusing the draining original.
         self._relaunch_attempts: Dict[str, int] = {}
         self._setup_workdirs: Dict[str, str] = {}  # setup_id -> per-run workdir
+        # setup_id -> {"target_name","build_id","build_config_name"} so teardown can
+        # name its cleanup cluster the same human-identifiable way as launch.
+        self._setup_run_meta: Dict[str, Dict[str, str]] = {}
         # launch_id -> kwargs replayed by retry_workload
         self._launch_kwargs: Dict[str, Dict] = {}
         self._skypilot_retry_complete_events: Dict[str, asyncio.Event] = {}
@@ -1153,20 +1179,95 @@ class Skypilot(Environment):
             return (f"{cloud}/{zone}" if cloud else zone, None)
         return cloud, None
 
+    # k8s RFC1123 label ceiling for pod names derived from the cluster name.
+    _MAX_CLUSTER_NAME_LEN = 63
+    # Cosmetic cap on each human-readable slug (build / target name): keeps a
+    # long name from dominating the cluster name. It is NOT a correctness
+    # limit — the only hard constraint is ``_MAX_CLUSTER_NAME_LEN`` above,
+    # enforced by the length budget in ``_cluster_name_for``.
+    _MAX_SLUG_LEN = 20
+
     @staticmethod
-    def _cluster_name_for(launch_id: str, attempt: int = 0) -> str:
-        """Generate a unique cluster name from a launch_id.
+    def _slugify(text: str, max_len: int = _MAX_SLUG_LEN) -> str:
+        """Reduce ``text`` to a lowercase, SkyPilot-safe slug.
+
+        Lowercases, collapses every run of non-``[a-z0-9]`` characters into a
+        single ``-``, strips leading/trailing ``-``, and truncates to
+        ``max_len`` (re-stripping any ``-`` left at the truncation boundary).
+        Returns ``""`` when nothing usable remains.
+
+        :param text: Free-form text (e.g. a target name).
+        :param max_len: Maximum slug length.
+        :returns: A slug matching ``[a-z0-9]([a-z0-9-]*[a-z0-9])?`` or ``""``.
+        """
+        slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+        return slug[:max_len].strip("-")
+
+    @staticmethod
+    def _cluster_name_for(
+        launch_id: str,
+        attempt: int = 0,
+        *,
+        target_name: str = "",
+        build_id: str = "",
+        build_config_name: str = "",
+    ) -> str:
+        """Generate a unique, human-identifiable cluster name.
+
+        Format::
+
+            gb-[<build>-][<slug(target_name)>-]<launch_id[:12]>[-r<attempt>]
+
+        where ``<build>`` is the slugified build.yaml name when set, otherwise
+        the full ``build_id`` (dashes kept) so it matches the identifier gbcli
+        users reference. Empty components are omitted, so with no metadata the
+        result is exactly ``gb-<launch_id[:12]>`` (unchanged legacy behavior).
+        Both the build and target components are budgeted so the whole name
+        (including any ``-r<attempt>`` suffix) stays within
+        ``_MAX_CLUSTER_NAME_LEN`` unconditionally — a real uuid4 ``build_id``
+        (<=36 chars) is well under its budget and so is emitted verbatim. Parts
+        join with single dashes (empties skipped, so no triple dashes) and the
+        result is ``rstrip``-ed of separators, so it always starts (``gb``) and
+        ends on an alphanumeric — satisfying SkyPilot's naming rule.
 
         :param launch_id: The launch identifier the cluster belongs to.
-        :param attempt: Relaunch attempt number. ``0`` (the initial launch)
-            yields the bare ``gb-<launch_id>`` name for backward compatibility;
-            ``> 0`` appends an ``-r<attempt>`` suffix so a retry provisions a
-            distinct cluster/allocation instead of colliding with the original
-            that may still be draining on the backend (slurm/lsf).
+        :param attempt: Relaunch attempt; ``> 0`` appends ``-r<attempt>``.
+        :param target_name: Human-readable target name; slugified + budgeted.
+        :param build_id: Build UUID; the fallback build tag (verbatim for a
+            UUID-length id, clamped only if it would overflow the ceiling).
+        :param build_config_name: build.yaml name; slugified and preferred over
+            ``build_id`` when non-empty.
         :returns: The deterministic cluster name for this launch + attempt.
         """
-        base = f"gb-{launch_id[:12]}"
-        return base if attempt <= 0 else f"{base}-r{attempt}"
+        launch = launch_id[:12]
+        retry = f"-r{attempt}" if attempt > 0 else ""
+        # `build` is the slug of the build.yaml name, else the full build_id
+        # (kept verbatim so it matches the id gbcli users reference). Clamp it
+        # to the room left under the ceiling after the never-truncated gb-
+        # prefix, launch tail, and retry suffix, so the <=_MAX_CLUSTER_NAME_LEN
+        # guarantee holds unconditionally; a uuid4 build_id (<=36) fits well
+        # within this budget and so is emitted unchanged.
+        build = Skypilot._slugify(build_config_name) or build_id
+        build_budget = (
+            Skypilot._MAX_CLUSTER_NAME_LEN - len("gb-") - 1 - len(launch) - len(retry)
+        )
+        build = build[: max(0, build_budget)].rstrip("-_.")
+        fixed = ["gb"]
+        if build:
+            fixed.append(build)
+        # Budget the optional target slug so the full name fits the ceiling.
+        without_slug = len("-".join(fixed)) + 1 + len(launch) + len(retry)
+        slug_budget = min(
+            Skypilot._MAX_SLUG_LEN,
+            Skypilot._MAX_CLUSTER_NAME_LEN - without_slug - 1,
+        )
+        slug = Skypilot._slugify(target_name, max_len=max(0, slug_budget))
+        parts = list(fixed)
+        if slug:
+            parts.append(slug)
+        parts.append(launch)
+        base = "-".join(parts).rstrip("-_.")
+        return f"{base}{retry}"
 
     async def setup_skypilot(
         self: Self,
@@ -1204,6 +1305,11 @@ class Skypilot(Environment):
             runmetadata.targetrun_id or "",
         )
         self._setup_workdirs[setup_id] = workdir
+        self._setup_run_meta[setup_id] = {
+            "target_name": runmetadata.target_name or "",
+            "build_id": runmetadata.build_id or "",
+            "build_config_name": runmetadata.build_config_name or "",
+        }
         logger.info(
             "setup_skypilot: per-run workdir for setup_id=%s -> %s",
             setup_id,
@@ -1223,10 +1329,16 @@ class Skypilot(Environment):
             ``Environment.setup``; used to look up the stashed path.
         """
         workdir = self._setup_workdirs.pop(setup_id, None)
+        run_meta = self._setup_run_meta.pop(setup_id, {})
         if not workdir:
             return
         _require_skypilot()
-        cluster_name = self._cluster_name_for(f"td-{setup_id}")
+        cluster_name = self._cluster_name_for(
+            f"td-{setup_id}",
+            target_name=run_meta.get("target_name", ""),
+            build_id=run_meta.get("build_id", ""),
+            build_config_name=run_meta.get("build_config_name", ""),
+        )
         logger.info(
             "teardown_skypilot: removing per-run workdir %s (setup_id=%s)",
             workdir,
@@ -1360,48 +1472,90 @@ class Skypilot(Environment):
                     return token
         return None
 
-    def get_launch_env_vars(
+    def _declared_secret_mappings(
+        self: Self, **kwargs: Any
+    ) -> List[EnvironmentVariableConfig]:
+        """Declared SkyPilot secret mappings for the shared launch-env composer.
+
+        Overrides :meth:`Environment._declared_secret_mappings` so only secrets
+        the step *declares* in
+        ``config.skypilot.secrets.secret_names_to_use_as_env_variable`` are
+        injected — never the whole secret bag, so a space's unrelated (and
+        possibly non-identifier-named) secrets never reach the task
+        (least-privilege, matching LSF/K8s).
+
+        :param kwargs: the launch context; only ``config`` is read.
+        :returns: the declared ``EnvironmentVariableConfig`` mappings.
+        """
+        return _get_step_skypilot_config(
+            kwargs.get("config") or {}
+        ).secrets.secret_names_to_use_as_env_variable
+
+    def _launch_env_layers(self: Self, **kwargs: Any) -> List[Dict[str, str]]:
+        """SkyPilot env layers for the shared launch-env composer.
+
+        Overrides :meth:`Environment._launch_env_layers`. Ordered
+        lowest->highest above declared secrets and below the standard set:
+        launcher ``envs`` < ``config.launcher_config.envs`` < the built-in
+        ``GB_SKYPILOT_*``/workdir/GB_TARGETRUN_ID/HF_TOKEN vars.
+
+        Built-in asset steps deliver their tokens explicitly through launcher
+        ``envs`` (HF_TOKEN / AWS keys), so they need no declaration. The
+        ``bindings`` HF_TOKEN is the *weakest* source: it fills in HF_TOKEN only
+        when no lower layer (declared secret, launcher or config ``envs``)
+        already provides it.
+
+        :param kwargs: the launch context; reads ``run_metadata`` (GB_TARGETRUN_ID),
+            ``launcher_config`` / ``config`` (``envs``), ``launch_id``,
+            ``cluster_name``, ``build_workdir``, and ``bindings`` (inline HF_TOKEN).
+        :returns: the ordered env layers to compose.
+        """
+        launcher_config = kwargs.get("launcher_config") or {}
+        config = kwargs.get("config") or {}
+        run_metadata = kwargs.get("run_metadata") or {}
+        launcher_envs = launcher_config.get("envs", {})
+        config_envs = config.get("launcher_config", {}).get("envs", {})
+        builtins = self._skypilot_builtin_env(
+            kwargs.get("launch_id", ""),
+            kwargs.get("cluster_name", ""),
+            kwargs.get("build_workdir"),
+        )
+        if run_metadata.get("targetrun_id"):
+            builtins["GB_TARGETRUN_ID"] = run_metadata["targetrun_id"]
+        # HF_TOKEN from bindings is the weakest source: fill in only when no
+        # lower layer (declared secret / launcher / config env) already sets it.
+        hf_token = self._first_hf_token(kwargs.get("bindings"))
+        declared = self._declared_secret_mappings(config=config)
+        lower_names = (
+            set(launcher_envs)
+            | set(config_envs)
+            | {m.env_name for m in declared if m.env_name}
+        )
+        if hf_token and "HF_TOKEN" not in lower_names:
+            builtins["HF_TOKEN"] = hf_token
+        return [launcher_envs, config_envs, builtins]
+
+    def _skypilot_builtin_env(
         self: Self,
-        run_metadata: Optional[Dict[str, Any]] = None,
-        launcher_config: Optional[Dict] = None,
-        config: Optional[Dict] = None,
-        launch_id: str = "",
-        cluster_name: str = "",
-        build_workdir: Optional[str] = None,
-        bindings: Optional[Dict] = None,
-        **kwargs: Any,
+        launch_id: str,
+        cluster_name: str,
+        build_workdir: Optional[str],
     ) -> Dict[str, str]:
-        """Build the full env dict for a skypilot step launch.
+        """Assemble the always-present ``GB_SKYPILOT_*``/workdir launcher vars.
 
-        Precedence (lowest->highest): secrets < launcher ``envs`` <
-        ``config.launcher_config.envs`` < the built-in
-        ``GB_SKYPILOT_*``/workdir/HF_TOKEN vars < the standard cross-environment
-        set from ``super()`` (GBTEST_ test-control vars + e.g. GB_BUILD_ID),
-        which is authoritative.
+        These sit above the secret and ``envs`` layers but below the standard
+        cross-environment set (see :meth:`get_launch_env_vars`). GB_TARGETRUN_ID
+        and HF_TOKEN are added by the caller because they are conditional.
 
-        :param run_metadata: launch run_metadata; forwarded to ``super()`` and
-            the source of GB_TARGETRUN_ID.
-        :param launcher_config: step.yaml launcher config (its ``envs``).
-        :param config: full step config (``config.launcher_config.envs`` is
-            picked up for auto-queued steps).
         :param launch_id: unique id for this launch (GB_SKYPILOT_LAUNCH_ID).
         :param cluster_name: the sky cluster name (GB_SKYPILOT_CLUSTER_NAME).
         :param build_workdir: per-run workdir (GB_BUILD_WORKDIR) if provisioned.
-        :param bindings: launch bindings; scanned for an inline HF_TOKEN.
-        :returns: the complete ``{name: value}`` env dict for the sky.Task.
+        :returns: a dict of the built-in launcher env vars.
         """
-        launcher_config = launcher_config or {}
-        config = config or {}
-        run_metadata = run_metadata or {}
-        env: Dict[str, str] = {}
-        if self.secrets:
-            env.update(self.secrets)
-        env.update(launcher_config.get("envs", {}))
-        env.update(config.get("launcher_config", {}).get("envs", {}))
-        env["GB_SKYPILOT_LAUNCH_ID"] = launch_id
-        env["GB_SKYPILOT_CLUSTER_NAME"] = cluster_name
-        if run_metadata.get("targetrun_id"):
-            env["GB_TARGETRUN_ID"] = run_metadata["targetrun_id"]
+        env: Dict[str, str] = {
+            "GB_SKYPILOT_LAUNCH_ID": launch_id,
+            "GB_SKYPILOT_CLUSTER_NAME": cluster_name,
+        }
         shared_workdir = (
             self.config.config.get("shared_workdir") if self.config else None
         )
@@ -1409,14 +1563,7 @@ class Skypilot(Environment):
             env["GB_SHARED_WORKDIR"] = shared_workdir
         if build_workdir:
             env["GB_BUILD_WORKDIR"] = build_workdir
-        hf_token = self._first_hf_token(bindings)
-        if hf_token and "HF_TOKEN" not in env:
-            env["HF_TOKEN"] = hf_token
-        env.update(super().get_launch_env_vars(run_metadata=run_metadata))
-        # Uniform with the other environments; a no-op here since skypilot's
-        # launcher vars are already GB_-prefixed (GB_SKYPILOT_*), so there are no
-        # LLMB_ names to mirror.
-        return self._add_gb_aliases(env)
+        return env
 
     async def launch_skypilot(
         self: Self,
@@ -1477,7 +1624,20 @@ class Skypilot(Environment):
             config = kwargs.get("config", {}) or {}
 
             attempt = self._relaunch_attempts.get(launch_id, 0)
-            cluster_name = self._cluster_name_for(launch_id, attempt)
+            run_metadata = kwargs.get("run_metadata") or {}
+            # run_metadata is normally a dict here; tolerate an
+            # EntityRunMetadata object defensively (codebase passes both shapes).
+            if not isinstance(run_metadata, dict):
+                run_metadata = (
+                    run_metadata.to_dict() if hasattr(run_metadata, "to_dict") else {}
+                )
+            cluster_name = self._cluster_name_for(
+                launch_id,
+                attempt,
+                target_name=run_metadata.get("target_name", "") or "",
+                build_id=run_metadata.get("build_id", "") or "",
+                build_config_name=run_metadata.get("build_config_name", "") or "",
+            )
             cloud = (
                 launcher_config.get("resources", {}).get("cloud") or self._get_cloud()
             )
@@ -2178,11 +2338,14 @@ class Skypilot(Environment):
             # launch_skypilot_teardown downs this SERVICE's cluster on purpose,
             # so a poll seeing it "gone" (FAILED above) is success, not a crash.
             # The teardown runs in a DIFFERENT Skypilot instance (one per target),
-            # so we match on the process-global set of torn-down cluster names --
-            # cluster_name here is gb-<launch_id[:12]>, the same name the teardown
-            # recorded. Exit cleanly before any FAILED event or raise so the step
-            # is marked SUCCESS. Checked after the poll (not only at the loop top)
-            # to close the race where teardown fires while this poll is in flight.
+            # so we match on the process-global set of torn-down cluster names.
+            # cluster_name here may carry optional gb-[<build>-][<target>-]
+            # prefixes (build = slug(build_config_name) or full build_id) but still
+            # ends with launch_id[:12], which is the same name
+            # the teardown/monitor computes from the replayed metadata. Exit
+            # cleanly before any FAILED event or raise so the step is marked
+            # SUCCESS. Checked after the poll (not only at the loop top) to close
+            # the race where teardown fires while this poll is in flight.
             if cluster_name in Skypilot._intentionally_torn_down_clusters:
                 logger.info(
                     "Cluster %s (launch_id %s) was intentionally torn down; "
@@ -2677,7 +2840,10 @@ class Skypilot(Environment):
             # Record BEFORE downing so the SERVICE's monitor -- which runs in a
             # different Skypilot instance and may be mid-poll -- treats the
             # cluster going away as success, not a WorkloadFailedException. Keyed
-            # by cluster name (gb-<launch_id[:12]>), the name the monitor sees.
+            # by cluster name (may carry optional gb-[<build>-][<target>-]
+            # prefixes, build = slug(build_config_name) or full build_id, but still
+            # ends with launch_id[:12]), the name the monitor
+            # sees.
             Skypilot._intentionally_torn_down_clusters.add(name)
             try:
                 target_launch_id = name_to_launch.get(name)

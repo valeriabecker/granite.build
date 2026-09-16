@@ -81,6 +81,13 @@ launchers:
 For cross-step state, point `shared_workdir` at a path backed by **EFS / FSx** mounted on every worker
 (e.g. `/mnt/efs`). See [skypilot.md](skypilot.md#shared_workdir).
 
+Containers run natively on AWS (Docker on the VM), so a step with an `image_id` still needs the shared
+mount visible **inside** the container, not just on the host — otherwise its output lands in the
+container's ephemeral layer and the downstream `hfpush` can't see it (the general caveat in
+[skypilot.md](skypilot.md#containerized-steps-must-also-see-the-shared-workdir-inside-the-container)).
+Ensure the EFS/FSx mount is exposed to the container (e.g. as a Docker bind/volume) so the per-run
+workdir resolves the same path on the host and in the container.
+
 ## Runbook: use a non-default AWS profile via the local secret store
 
 Use this when the gbserver host **already has a working `~/.aws/credentials` `[default]`** whose
@@ -174,6 +181,80 @@ pytest -s -m extended --strict-markers \
   `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`.
 - **Region is separate.** Placement comes from the launcher `resources.infra` (e.g. `aws/us-east-2`),
   not from this profile.
+
+## Quickstart: run the aws step tests for the first time
+
+The per-cluster **step tests** (`steps/{byoc,eval,dpk}/skypilot/test/aws/…`) provision a real
+EC2 instance and are gated so they never launch without credentials. Starting from just an AWS
+access-key pair, with the repo `.venv` built (`make venv` at the repo root):
+
+1. **Give the build its launch credentials.** The committed `environment.yaml` selects the
+   `gb-skypilot` profile, so your key pair needs to reach that profile. Pick one path:
+
+   **A — simplest (local/standalone): add the profile to `~/.aws/credentials` by hand.**
+
+   ```ini
+   [gb-skypilot]
+   aws_access_key_id = AKIA...
+   aws_secret_access_key = ...
+   ```
+
+   gbserver leaves an existing `gb-skypilot` profile as-is (the `GB_AWS_*` secrets are lenient
+   when absent) and SkyPilot reads it. Do **not** *also* seed the secret store (path B) with
+   different values — a mismatch raises `SkypilotConfigCollisionError`.
+
+   **B — portable (standalone *and* shared): seed the secret store.** gbserver materializes the
+   `gb-skypilot` profile from the `GB_AWS_*` secrets at launch, so the *same* `environment.yaml`
+   also works in a server deployment (where the server-managed store supplies them):
+
+   ```bash
+   mkdir -p ~/.granite.build/space_secrets
+   python3 - <<'PY'
+   import os, base64, json, pathlib
+   d = pathlib.Path.home() / ".granite.build" / "space_secrets"; d.mkdir(parents=True, exist_ok=True)
+   enc = lambda v: base64.b64encode(v.encode()).decode()
+   p = d / "aws.json"
+   p.write_text(json.dumps({
+       "GB_AWS_ACCESS_KEY_ID":     enc(os.environ["AWS_ACCESS_KEY_ID"]),
+       "GB_AWS_SECRET_ACCESS_KEY": enc(os.environ["AWS_SECRET_ACCESS_KEY"]),
+   }, indent=2)); p.chmod(0o600)
+   PY
+   ```
+
+2. **Set the skip-gate** so the test runs instead of self-skipping — export **either**
+   `AWS_PROFILE=gb-skypilot` **or** the `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` pair. A bare
+   `~/.aws/credentials` `[default]` does *not* satisfy the gate on its own.
+
+3. **Verify the credentials without provisioning EC2:**
+
+   ```bash
+   sky api stop
+   env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY sky check aws   # expect: AWS: enabled
+   ```
+
+   Stripping the env vars proves the `gb-skypilot` profile — not your shell — supplies the creds.
+
+4. **Run a fixture** — this provisions a real EC2 instance, runs the build, and tears it down:
+
+   ```bash
+   AWS_PROFILE=gb-skypilot make -C steps/dpk/skypilot test TEST_DIR=test/aws-tok
+   # or byoc, and the heavier dpk pii fixture:
+   AWS_PROFILE=gb-skypilot make -C steps/dpk/skypilot test TEST_DIR=test/aws-pii
+   ```
+
+   `make test` forces pytest's `-s` (required — a second SkyPilot launch in a captured process
+   hits `OSError: [Errno 9] Bad file descriptor`). Reaching SUCCESS proves the step ran end to
+   end on EC2. (`eval` is a custom-image step: publish its image first — see
+   `steps/eval/skypilot/README.md`.)
+
+5. **Confirm nothing leaked:**
+
+   ```bash
+   sky status --refresh    # expect: No existing clusters
+   ```
+
+Region/zone come from the launcher `resources` (`infra`, e.g. `aws/us-east-2`) or
+`AWS_DEFAULT_REGION`, not from the profile.
 
 ## Example `environment.yaml`
 

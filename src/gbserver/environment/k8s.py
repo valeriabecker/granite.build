@@ -85,7 +85,10 @@ from gbserver.types.buildevent import (
 from gbserver.types.constants import (
     K8S_USE_ASPERA,
 )
-from gbserver.types.environment.k8s import StepK8sConfig
+from gbserver.types.environment.k8s import (
+    EnvironmentVariableConfig,
+    StepK8sConfig,
+)
 from gbserver.types.environmentconfig import (
     ENVIRONMENT_FILENAME,
     EnvironmentConfig,
@@ -267,6 +270,54 @@ class K8s(Environment):
         if not k8s_dict:
             return StepK8sConfig()  # empty default
         return StepK8sConfig(**k8s_dict)
+
+    @staticmethod
+    def _secret_env_helm_values(
+        environment_variables: List[EnvironmentVariableConfig],
+        space_secret: Optional[str],
+    ) -> List[Tuple[str, str]]:
+        """Map declared secret env vars to Helm ``--set`` secretKeyRef args.
+
+        Unlike LSF/SkyPilot, K8s never resolves secret VALUES in the build
+        server: each declared env var becomes a ``valueFrom.secretKeyRef`` into
+        the space's single Kubernetes Secret (``space_secret``), and the kubelet
+        mounts the value into the pod at runtime.
+
+        The ``secret_names_to_use_as_env_variable`` allow-list is shared with
+        LSF/SkyPilot, so the pod env-var name is the declared ``env_name``
+        **verbatim** (portable across backends — the Helm chart renders the
+        name unchanged). The Secret **data-key** it references defaults to the
+        lowercased ``env_name`` when no explicit ``secret_name`` is given — the
+        long-standing K8s convention, since the space Secret stores each value
+        under its lowercased key.
+
+        :param environment_variables: declared env-var -> secret mappings.
+        :param space_secret: name of the space K8s Secret (its
+            ``secretKeyRef.name``); required when any env var is declared.
+        :returns: ``(helm_key, value)`` tuples to append to the ``--set``
+            overrides. A missing declared ``secret_name`` defaults the data-key
+            to the lowercased ``env_name``.
+        :raises ValueError: if a declared entry omits ``env_name`` (shared
+            fail-fast validation, consistent with LSF/SkyPilot), or if any env
+            var is declared but ``space_secret`` is unset. Secret values never
+            appear in the message.
+        """
+        values: List[Tuple[str, str]] = []
+        for env_var in environment_variables:
+            # Same fail-fast validation as LSF/SkyPilot: a malformed entry
+            # (missing env_name) raises rather than being silently dropped.
+            env_name = Environment._require_declared_env_name(env_var.env_name)
+            if not space_secret:
+                raise ValueError("setup_config['space']['secret'] is missing")
+            # Pod env-var name is the verbatim env_name (portable with
+            # LSF/SkyPilot). The Secret data-key defaults to the lowercased
+            # env_name -- the historical K8s convention -- unless an explicit
+            # secret_name selects a different key.
+            secret_key = env_var.secret_name or env_name.lower()
+            base = f"k8s.env.{env_name}.valueFrom.secretKeyRef"
+            values.append((f"{base}.name", space_secret))
+            values.append((f"{base}.key", secret_key))
+        return values
 
     def _get_k8s_labels_and_annotations(self: Self, kwargs: Dict) -> Tuple[Dict, Dict]:
         labels = kwargs.get("labels", {})
@@ -739,24 +790,13 @@ class K8s(Environment):
                 dockerconfig_files.append((idx, tmp_file.name))
 
         # --- Environment Variables ---
+        # Each declared secret is exposed via secretKeyRef under its verbatim
+        # env_name (portable with LSF/SkyPilot); the Secret data-key defaults to
+        # the lowercased env_name. See _secret_env_helm_values.
         space_secret = setup_config.get("space", {}).get("secret")
-        for env_var in environment_variables:
-            if not env_var.env_name:
-                continue
-            secret_key = env_var.secret_name or env_var.env_name.lower()
-            if not space_secret:
-                raise ValueError("setup_config['space']['secret'] is missing")
-
-            # Helm nested --set for secretKeyRef
-            extra_runmetadata_values.append(
-                (
-                    f"k8s.env.{env_var.env_name}.valueFrom.secretKeyRef.name",
-                    space_secret,
-                )
-            )
-            extra_runmetadata_values.append(
-                (f"k8s.env.{env_var.env_name}.valueFrom.secretKeyRef.key", secret_key)
-            )
+        extra_runmetadata_values.extend(
+            self._secret_env_helm_values(environment_variables, space_secret)
+        )
 
         # Propagate the standard cross-environment vars (GBTEST_ test-control
         # vars + GB_BUILD_ID; from Environment.get_launch_env_vars) as strings —

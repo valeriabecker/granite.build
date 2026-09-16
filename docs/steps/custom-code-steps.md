@@ -122,7 +122,22 @@ config:
           secret_name: aws-secret-key
 ```
 
-For image pull secrets (when using a private container registry):
+The same declarative `secrets.secret_names_to_use_as_env_variable` allow-list is shared across
+environments; place it under the matching per-cloud section — `config.k8s`, `config.lsf`, or
+`config.skypilot`. Every environment injects **only** the secrets a step declares (least-privilege).
+
+**Delivery differs by environment:**
+
+- **LSF and SkyPilot** resolve the secret value in the build server and inject it as a task
+  environment variable. The value is looked up in the space secret bag under `secret_name` (or the
+  `env_name` **verbatim** when `secret_name` is omitted).
+- **K8s** never materializes the value in the build server: it hands the secret *name* to Helm as a
+  `valueFrom.secretKeyRef` and the kubelet mounts the value into the pod at runtime. The pod env var
+  uses the `env_name` **verbatim** (portable with LSF/SkyPilot). When `secret_name` is omitted the
+  Secret **data-key** defaults to the **lowercased** `env_name` — the long-standing K8s convention,
+  since the space Secret stores each value under its lowercased key.
+
+For image pull secrets (when using a private container registry — K8s only):
 
 ```yaml
 config:
