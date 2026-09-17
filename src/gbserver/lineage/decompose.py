@@ -263,6 +263,20 @@ def to_lineage_rows(
             target=identify(target) if target is not None else None,
             source_uri=_artifact_uri(source),
             target_uri=_artifact_uri(target),
+            # Read verbatim, NOT normalized. The prototype's normalize_filter
+            # (ALGORITHM.md 3.3) collapses a [{"name","value"}] array into a map,
+            # maps an empty array / malformed JSON to None, and falls back to a
+            # "partition_filter" key. None of that is ported, because partition
+            # filters do not exist in this domain: ArtifactRegistration has no
+            # filter or partition field, so no producer can emit one and these are
+            # always None today. The traversal likewise implements no filter
+            # propagation (ALGORITHM.md 4.3) -- walk.py never reads these columns.
+            #
+            # If partitioned artifacts ever arrive, port normalization and
+            # propagation TOGETHER, and backfill: rows written before
+            # normalization hold raw strings, so an array-shaped filter and an
+            # equivalent object-shaped one are different values and would never
+            # match once propagation starts comparing them.
             source_filter=source.get("filter") if source else None,
             target_filter=target.get("filter") if target else None,
             source_artifact=source,

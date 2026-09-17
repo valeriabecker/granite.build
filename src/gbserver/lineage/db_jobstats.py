@@ -407,6 +407,8 @@ def _row_from_draft(
     draft,
     build_id: str,
     target_run_uuid: str,
+    source_system: str = SOURCE_SYSTEM,
+    derivable: bool = True,
 ) -> StoredLineageRow:
     """Turn a decomposed draft into the stored row.
 
@@ -417,6 +419,20 @@ def _row_from_draft(
     The promoted pieces are parsed back out of the canonical identifier rather than
     threaded separately, so a column can never disagree with the identifier it
     describes -- they have one source.
+
+    Args:
+        draft: the decomposed row.
+        build_id: the build this row came from; empty for lineage with no build.
+        target_run_uuid: the target run this row came from; empty when there is
+            none.
+        source_system: which system the row came from. Defaults to this sink's
+            own :data:`SOURCE_SYSTEM`; an importer passes its own name so its rows
+            are distinguishable from the ones the scan derives.
+        derivable: whether a re-scan can regenerate the row. Defaults to ``True``
+            because the scan can. An importer MUST pass ``False``: a rebuild
+            deletes only derivable rows, so imported lineage marked derivable would
+            be destroyed by the next rebuild and -- unlike scanned lineage -- it
+            cannot be re-derived once its upstream source is switched off.
     """
     from gbserver.lineage.identity import LineageIdentityError, parse_canonical_id
 
@@ -456,8 +472,8 @@ def _row_from_draft(
         target_name=target_pieces.get("name", ""),
         target_table=target_pieces.get("table", ""),
         target_revision=target_pieces.get("revision", ""),
-        source_system=SOURCE_SYSTEM,
-        derivable=True,
+        source_system=source_system,
+        derivable=derivable,
         build_id=build_id,
         target_run_uuid=target_run_uuid,
         metadata=dict(draft.metadata or {}),
