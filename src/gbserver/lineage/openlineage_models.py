@@ -103,11 +103,26 @@ class GraphNodeType(str, Enum):
 
 
 class GraphNode(BaseModel):
+    """One node of a walked graph.
+
+    ``id`` is the artifact's normalized URI, or ``run:<job_id>`` for a run node --
+    prefixed so a job id can never collide with an artifact URI in the shared id
+    space that ``GraphEdge`` references.
+    """
+
     id: str
     node_type: GraphNodeType
     name: str
     artifact_type: Optional[str] = None
     is_root: bool = False
+    depth: Optional[int] = Field(
+        default=None,
+        description=(
+            "Hops from the nearest seed, shortest path; 0 for a seed. None for a "
+            "run node, which hangs off an edge rather than being walked to, and for "
+            "an artifact the walk did not reach."
+        ),
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -122,6 +137,97 @@ class ArtifactGraphRequest(BaseModel):
     artifact_type: Optional[str] = None
     max_depth: int = Field(default=10, ge=1, le=50)
     direction: str = "both"
+
+
+class BuildGraphRequest(BaseModel):
+    """A request for the lineage graph seeded from one build's artifacts.
+
+    A build is not a graph node -- it is a way to seed one -- so this carries no
+    node identity, only the build to seed from and how far to expand.
+    """
+
+    build_id: str
+    max_depth: int = Field(default=10, ge=1, le=50)
+    direction: str = "both"
+
+
+class BuildGraphResponse(BaseModel):
+    """The walked graph of a build.
+
+    ``root_id`` is the build id, which names no node: a build-seeded graph has
+    several roots, so no node is flagged ``is_root``.
+    """
+
+    root_id: str
+    nodes: List[GraphNode] = Field(default_factory=list)
+    edges: List[GraphEdge] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class LineageQueryRequest(BaseModel):
+    """A lineage query where every filter is optional.
+
+    One entry point so a caller can ask however it happens to hold the artifact:
+    by URI in any spelling, by the job that produced it, or with nothing at all.
+    Both filters map to an indexed text column, so any combination is one predicate.
+
+    There is deliberately no ``build_id`` filter: the index has no such column
+    (a build is granite.build's own concept, empty on every imported row), and a
+    build-scoped view goes through ``POST /lineage/build``, which resolves the build
+    outside the index and seeds this same walk.
+    """
+
+    uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "The artifact's URI in any spelling; it is normalized server-side, so a "
+            "browser URL and the runtime's own URI resolve to one artifact."
+        ),
+    )
+    job_id: Optional[str] = Field(
+        default=None,
+        description="Seed from every endpoint of this job execution.",
+    )
+    max_depth: int = Field(default=10, ge=1, le=50)
+    direction: str = "both"
+
+
+class LineageGraphResponse(BaseModel):
+    """The walked graph.
+
+    ``root_id`` is the URI the query resolved to, or ``""`` when the query named no
+    single artifact (a job-seeded or unfiltered query has several roots, so no node
+    is flagged ``is_root``).
+    """
+
+    root_id: str = ""
+    nodes: List[GraphNode] = Field(default_factory=list)
+    edges: List[GraphEdge] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class LineageRunEntry(BaseModel):
+    """One job execution touching an artifact, as the run listing reports it."""
+
+    job_id: str
+    source: str = ""
+    target: str = ""
+    is_self_loop: bool = False
+    job: Dict[str, Any] = Field(default_factory=dict)
+    source_system: str = ""
+
+
+class LineageRunsResponse(BaseModel):
+    """A page of the runs touching one artifact.
+
+    The drill-down for a graph node the walk collapsed. ``total`` is the unpaged count,
+    so a caller can tell how much is left rather than guessing from a short page.
+    """
+
+    runs: List[LineageRunEntry] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
 
 
 class LineageNodeRef(BaseModel):

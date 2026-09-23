@@ -28,6 +28,7 @@ import uuid as uuid_module
 
 import pytest
 
+from gbserver.lineage.attributes import build_attributes
 from gbserver.storage.sqlite.storage_factory import SqliteStorageFactory
 from gbserver.storage.stored_lineage_row import TERMINAL, StoredLineageRow
 
@@ -46,11 +47,25 @@ def storage_fixture():
 
 def row(
     job_id: str = "J",
-    source: str = "model:h/ns::a|t",
-    target: str = "dataset:h/ns::b|t",
+    source: str = "lh://prod/ns/models/t/a",
+    target: str = "lh://prod/ns/datasets/t/b",
     **kwargs,
 ) -> StoredLineageRow:
-    return StoredLineageRow(job_id=job_id, source=source, target=target, **kwargs)
+    """A row with URI endpoints.
+
+    ``source_system`` is accepted as a keyword for readability and folded into
+    ``attributes``, where it lives: it is not a column, so it is not queryable.
+    """
+    if "attributes" in kwargs:
+        attributes = dict(kwargs.pop("attributes") or {})
+    else:
+        attributes = build_attributes(
+            source_system=kwargs.pop("source_system", "granite.build"),
+        )
+    assert not kwargs, f"unhandled row() keywords: {sorted(kwargs)}"
+    return StoredLineageRow(
+        job_id=job_id, source=source, target=target, attributes=attributes
+    )
 
 
 class TestHops:
@@ -98,58 +113,73 @@ class TestHops:
         assert len(storage.get_rows_by_source(["a", "a", "a"])) == 1
 
 
-class TestSeeding:
-    def test_rows_by_build(self, storage):
-        storage.add(row(job_id="J1", build_id="B1"))
-        storage.add(row(job_id="J2", build_id="B1", target="dataset:h/ns::c|t"))
-        storage.add(row(job_id="J3", build_id="B2"))
-        assert len(storage.get_rows_by_build("B1")) == 2
+class TestJobGrouping:
+    """A job's rows are recoverable as a unit.
 
-    def test_empty_build_id_returns_nothing(self, storage):
-        """Imported rows carry build_id="" and must not all match one query."""
-        storage.add(row(job_id="J1", build_id=""))
-        storage.add(row(job_id="J2", build_id="", target="dataset:h/ns::c|t"))
-        assert storage.get_rows_by_build("") == []
+    This is the only grouping the index offers, and deliberately so: ``job_id`` is
+    the one identifier every lineage source has. A build or a target run is
+    granite.build's own concept, so a process-scoped view resolves its scope in that
+    system and seeds the walk with URIs instead.
+    """
 
     def test_rows_by_job_recovers_the_whole_execution(self, storage):
-        """The N*M decomposition stays regroupable through storage."""
-        for i, (src, tgt) in enumerate(
-            [("i1", "o1"), ("i1", "o2"), ("i2", "o1"), ("i2", "o2")]
-        ):
-            storage.add(row(job_id="J", source=src, target=tgt))
-        rows = storage.get_rows_by_job("J")
-        assert len(rows) == 4
-        assert {r.source for r in rows} == {"i1", "i2"}
-        assert {r.target for r in rows} == {"o1", "o2"}
+        for src in ("lh://prod/ns/tables/i1", "lh://prod/ns/tables/i2"):
+            storage.add(row(job_id="J", source=src))
+        assert len(storage.get_rows_by_job("J")) == 2
+
+    def test_empty_job_id_returns_nothing(self, storage):
+        storage.add(row())
+        assert storage.get_rows_by_job("") == []
+
+    def test_process_ids_are_not_columns(self, storage):
+        """A build or target run id may be carried, but only in the blob.
+
+        An indexed column that is empty on every imported row indexes nothing, and
+        that is what these were: the importer contract sets both to "" for every
+        source that is not granite.build.
+        """
+        storage.add(row(job_id="P", attributes={"build_id": "b1", "target_run_uuid": "tr1"}))
+        names = storage.get_column_names()
+        assert "build_id" not in names
+        assert "target_run_uuid" not in names
+        # Still readable, just not queryable.
+        assert storage.get_rows_by_job("P")[0].attributes["build_id"] == "b1"
 
 
 class TestDedupSupport:
-    """Presence-based dedup, not count-based."""
+    """Presence-based dedup, keyed on job_id.
 
-    def test_has_rows_for_target_run(self, storage):
-        storage.add(row(target_run_uuid="TR1"))
-        assert storage.has_rows_for_target_run("TR1")
-        assert not storage.has_rows_for_target_run("TR2")
+    The sink asks "do these jobs already have rows?" on every watcher tick. It is
+    the only thing standing between a re-selected job and duplicate rows, so it has
+    to be an indexed lookup rather than a scan.
+    """
 
-    def test_empty_target_run_is_not_recorded(self, storage):
-        storage.add(row(target_run_uuid=""))
-        assert not storage.has_rows_for_target_run("")
+    def test_has_rows_for_job(self, storage):
+        storage.add(row(job_id="J"))
+        assert storage.has_rows_for_job("J")
+        assert not storage.has_rows_for_job("OTHER")
 
-    def test_get_recorded_target_runs_filters(self, storage):
-        storage.add(row(job_id="J1", target_run_uuid="TR1"))
-        storage.add(row(job_id="J2", target_run_uuid="TR3"))
-        assert storage.get_recorded_target_runs(["TR1", "TR2", "TR3"]) == {"TR1", "TR3"}
+    def test_empty_job_is_not_recorded(self, storage):
+        assert not storage.has_rows_for_job("")
+
+    def test_get_recorded_jobs_filters(self, storage):
+        storage.add(row(job_id="J1"))
+        storage.add(row(job_id="J2"))
+        assert storage.get_recorded_jobs(["J1", "J2", "J3"]) == {"J1", "J2"}
 
     def test_presence_is_independent_of_row_count(self, storage):
-        """A target run writing N*M rows is recorded once, however many rows.
+        """One row is enough: a job's rows are written together.
 
-        The reconciler's expected_counts is one W&B run per output artifact, which
-        can never match an N*M row count -- comparing against it would report every
-        target as unrecorded forever and re-record in a loop.
+        The reconciler's ``expected_counts`` counts one W&B run per output artifact,
+        which never equals an N*M row count -- honouring it would report every job
+        unrecorded forever and re-record on every scan.
         """
-        for i in range(6):
-            storage.add(row(job_id="J", source=f"i{i}", target_run_uuid="TR1"))
-        assert storage.get_recorded_target_runs(["TR1"]) == {"TR1"}
+        for tgt in ("s3://b/o1", "s3://b/o2", "s3://b/o3"):
+            storage.add(row(job_id="MANY", target=tgt))
+        assert storage.get_recorded_jobs(["MANY"]) == {"MANY"}
+
+    def test_empty_batch_queries_nothing(self, storage):
+        assert storage.get_recorded_jobs([]) == set()
 
 
 class TestUniqueConstraint:
@@ -192,39 +222,6 @@ class TestUniqueConstraint:
         assert len(storage.get_rows_by_source(["a"])) == 2
 
 
-class TestRebuild:
-    def test_deletes_only_derivable_rows_of_that_system(self, storage):
-        storage.add(row(job_id="J1", source_system="granite.build", derivable=True))
-        storage.add(
-            row(
-                job_id="J2",
-                source_system="granite.build",
-                derivable=True,
-                target="dataset:h/ns::c|t",
-            )
-        )
-        storage.add(row(job_id="J3", source_system="lh", derivable=False))
-        storage.add(
-            row(
-                job_id="J4",
-                source_system="granite.build",
-                derivable=False,
-                target="dataset:h/ns::d|t",
-            )
-        )
-
-        assert storage.delete_derivable_rows("granite.build") == 2
-
-        remaining = {r.job_id for r in storage.get_by_where({})}
-        assert remaining == {"J3", "J4"}
-
-    def test_imported_rows_survive_a_rebuild(self, storage):
-        """Imported lineage is not re-derivable once the upstream source is gone."""
-        storage.add(row(job_id="IMP", source_system="lh", derivable=False))
-        storage.delete_derivable_rows("granite.build")
-        assert len(storage.get_rows_by_job("IMP")) == 1
-
-
 class TestSchema:
     """The declared indexes and unique must actually exist in the table."""
 
@@ -246,7 +243,7 @@ class TestSchema:
 
     @pytest.mark.parametrize(
         "column",
-        ["source", "target", "job_id", "target_run_uuid", "build_id", "source_system"],
+        ["source", "target", "job_id"],
     )
     def test_column_is_indexed(self, storage, column):
         storage.add(row())
@@ -261,9 +258,15 @@ class TestSchema:
         assert unique, statements
         assert "(job_id, source, target)" in unique[0]
 
-    def test_traversal_columns_are_text(self, storage):
+    def test_every_promoted_column_is_text(self, storage):
         """get_by_where only builds an IN clause for string columns; anything else
-        silently degrades to ``column == [list]``.
+        silently degrades to ``column == [list]`` -- a predicate that returns
+        plausible but wrong rows with no error.
+
+        So the invariant is stronger than "the batched ones are text": *every*
+        promoted column is text, which makes that failure unreachable rather than
+        merely avoided by convention: there is no non-text promoted column left for
+        it to happen to.
         """
         storage.add(row())
         columns = {
@@ -272,47 +275,107 @@ class TestSchema:
                 storage, f"PRAGMA table_info('{storage.table_name}')"
             )
         }
-        for column in ("source", "target", "job_id", "target_run_uuid", "build_id"):
+        assert "source_system" not in columns
+        assert "build_id" not in columns
+        assert "target_run_uuid" not in columns
+
+        for column in ("source", "target", "job_id"):
             assert columns[column].startswith("VARCHAR"), (column, columns[column])
-        assert columns["derivable"] == "BOOLEAN"
+
+        non_text = {
+            name: kind
+            for name, kind in columns.items()
+            # "index" is the autoincrement PK and "json" is the blob; neither is
+            # ever a query predicate.
+            if name not in ("index", "json") and not kind.startswith("VARCHAR")
+        }
+        assert not non_text, f"a non-text promoted column is a latent bug: {non_text}"
+
+    def test_uri_columns_are_wide_enough_for_a_real_uri(self, storage):
+        """The endpoints are 512, matching MAX_LINEAGE_URI_LENGTH.
+
+        A truncated URI would merge two distinct artifacts sharing a prefix, so the
+        normalizer drops anything longer rather than letting the column cut it.
+        """
+        from gbserver.storage.stored_lineage_row import MAX_LINEAGE_URI_LENGTH
+
+        storage.add(row())
+        columns = {
+            name: kind
+            for _, name, kind, *_ in self._query_schema(
+                storage, f"PRAGMA table_info('{storage.table_name}')"
+            )
+        }
+        for column in ("source", "target"):
+            assert columns[column] == f"VARCHAR({MAX_LINEAGE_URI_LENGTH})"
+
+    def test_a_maximum_length_uri_survives_a_round_trip(self, storage):
+        """Proves the width landed: at 256 this would truncate silently."""
+        from gbserver.storage.stored_lineage_row import MAX_LINEAGE_URI_LENGTH
+
+        prefix = "hf://huggingface.co/models/org/"
+        long_uri = prefix + "x" * (MAX_LINEAGE_URI_LENGTH - len(prefix))
+        storage.add(row(job_id="LONG", source=long_uri))
+        stored = storage.get_rows_by_source([long_uri])
+        assert stored, "a maximum-length URI did not round trip"
+        assert stored[0].source == long_uri
 
 
 class TestRoundTrip:
     def test_all_fields_survive_storage(self, storage):
         original = StoredLineageRow(
             job_id="J",
-            source="model:h/ns::a|t",
-            target="fileset:h/ns::b@v1|t",
-            source_filter='{"dt":"2024"}',
-            target_filter=None,
-            source_kind="model",
-            source_namespace="h/ns",
-            source_name="a",
-            source_table="t",
-            source_revision="",
-            target_kind="fileset",
-            target_namespace="h/ns",
-            target_name="b",
-            target_table="t",
-            target_revision="v1",
-            source_system="lh",
-            derivable=False,
-            build_id="B",
-            target_run_uuid="TR",
-            metadata={"job_name": "train", "owner": "someone"},
+            source="lh://prod/ns/models/t/a",
+            target="hf://huggingface.co/models/org/b",
+            attributes={
+                "job_name": "train",
+                "owner": "someone",
+                "source_system": "lh",
+                "source_kind": "model",
+                "target_kind": "model",
+                "space_name": "sp",
+                "build_id": "B",
+                "target_run_uuid": "TR",
+            },
         )
         storage.add(original)
         stored = storage.get_rows_by_job("J")[0]
 
         assert stored.source == original.source
         assert stored.target == original.target
-        assert stored.source_filter == '{"dt":"2024"}'
-        assert stored.target_filter is None
-        assert stored.target_revision == "v1"
-        assert stored.source_system == "lh"
-        assert stored.derivable is False
-        # metadata lives in the JSON blob, not a column
-        assert stored.metadata == {"job_name": "train", "owner": "someone"}
+        # Everything else lives in the JSON blob, whole -- including the process
+        # ids, which are not columns.
+        assert stored.attributes == original.attributes
+
+    def test_a_row_always_records_its_origin(self, storage):
+        """``origin`` is never absent: provenance is not an optional detail.
+
+        A row whose system is unknown could not be scoped by a rebuild -- it would
+        be deleted as granite.build's or preserved as an importer's by accident. The
+        other groups ARE omitted when empty, so a reader can tell "not recorded"
+        from "recorded empty"; this one is not.
+        """
+        storage.add(row(job_id="BARE"))
+        attributes = storage.get_rows_by_job("BARE")[0].attributes
+        assert attributes["origin"]["system"] == "granite.build"
+        # Nothing described the endpoints or the job, so those groups are absent.
+        assert "source" not in attributes
+        assert "job" not in attributes
+
+    def test_the_model_default_for_attributes_is_an_empty_dict(self, storage):
+        """The field itself defaults empty; ``build_attributes`` is what fills it."""
+        storage.add(StoredLineageRow(job_id="RAW", source="s3://b/x", target="s3://b/y"))
+        assert storage.get_rows_by_job("RAW")[0].attributes == {}
+
+    def test_attributes_are_not_queryable(self, storage):
+        """The blob is Text, so nothing inside it can be a predicate.
+
+        Asserted rather than assumed: it is the reason the rebuild filters in
+        Python, and the reason anything needing a filter has to become a column.
+        """
+        storage.add(row(job_id="A", source_system="lh"))
+        assert "source_system" not in storage.get_column_names()
+        assert "attributes" not in storage.get_column_names()
 
     def test_terminal_helpers_survive_storage(self, storage):
         storage.add(row(job_id="C", source=TERMINAL, target="x"))
@@ -375,35 +438,39 @@ class TestWalkAgainstRealStorage:
         assert back.depths == {"o1": 0, "i1": 1, "i2": 1, "i3": 1}
 
 
-class TestStoredUriColumns:
-    """The URI columns exist as real columns and round-trip.
+class TestUriIsTheIdentity:
+    """The endpoints hold URIs, which is what collapses the old schema.
 
-    They are what the read path hands the UI as node identity, and a canonical
-    identifier does not encode a scheme -- so an ``hf://`` or ``s3://`` URI is only
-    ever available because it was stored here.
+    A canonical identifier did not encode a scheme, so the old row carried a
+    separate ``source_uri``/``target_uri`` pair to keep the real URI at all. With
+    the URI *as* the identity those columns are redundant, and the root lookup
+    becomes an index seek instead of a paged full scan.
     """
 
-    def test_uri_columns_are_promoted(self, storage):
+    def test_the_separate_uri_columns_are_gone(self, storage):
         storage.add(row())
-        assert "source_uri" in storage.get_column_names()
-        assert "target_uri" in storage.get_column_names()
+        names = storage.get_column_names()
+        assert "source_uri" not in names
+        assert "target_uri" not in names
 
-    def test_uris_round_trip(self, storage):
-        storage.add(row(source_uri="s3://bkt/in", target_uri="hf:///org/out"))
-        stored = storage.get_by_where({"job_id": "J"})[0]
-        assert stored.source_uri == "s3://bkt/in"
-        assert stored.target_uri == "hf:///org/out"
+    def test_endpoints_hold_real_uris(self, storage):
+        storage.add(
+            row(job_id="U", source="s3://bkt/in", target="hf:///org/out")
+        )
+        stored = storage.get_by_where({"job_id": "U"})[0]
+        assert stored.source == "s3://bkt/in"
+        assert stored.target == "hf:///org/out"
 
-    def test_uris_default_to_empty_for_rows_that_have_none(self, storage):
-        storage.add(row())
-        stored = storage.get_by_where({"job_id": "J"})[0]
-        assert stored.source_uri == ""
-        assert stored.target_uri == ""
+    def test_a_uri_is_found_by_an_indexed_lookup(self, storage):
+        """The read path resolves a root this way, with one query and no scan."""
+        storage.add(row(job_id="U", source="s3://bkt/in", target="s3://bkt/out"))
+        assert [r.job_id for r in storage.get_rows_by_source(["s3://bkt/in"])] == ["U"]
+        assert [r.job_id for r in storage.get_rows_by_target(["s3://bkt/out"])] == ["U"]
 
-    def test_uri_is_outside_the_unique_index(self, storage):
-        # Row identity is (job_id, source, target). A differing URI must not let a
-        # duplicate row in, or re-ingesting an artifact whose URI was rewritten
-        # would double every edge it touches.
-        storage.add(row(source_uri="s3://bkt/one"))
+    def test_differing_attributes_do_not_admit_a_duplicate_row(self, storage):
+        # Row identity is (job_id, source, target). Anything in the blob is
+        # outside it, so re-ingesting a row whose metadata changed must not
+        # double the edge.
+        storage.add(row(attributes={"job_name": "one"}))
         with pytest.raises(Exception):
-            storage.add(row(source_uri="s3://bkt/two"))
+            storage.add(row(attributes={"job_name": "two"}))

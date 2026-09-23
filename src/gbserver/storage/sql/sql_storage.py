@@ -33,6 +33,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from gbserver.storage.stored_lineage_row import MAX_LINEAGE_URI_LENGTH
 from gbserver.storage.sql.cert_file import get_ssl_cert_file
 from gbserver.storage.sql.engine_cache import get_singleton_engine_cache
 from gbserver.storage.storage import (
@@ -63,6 +64,14 @@ _CLASS_NAME_INDEX = AtomicInteger()
 
 # Regex pattern for valid SQL identifiers (alphanumeric + underscore, cannot start with digit)
 _VALID_SQL_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+# Promoted string columns that hold a normalized lineage URI rather than a name or
+# a label. The width is the lineage row's limit, imported rather than restated so
+# the DB column and the guard that keeps a URI inside it cannot drift. It is
+# narrower than the 1024 the other URI columns get, because these two are indexed
+# AND both sit in the ``(job_id, source, target)`` unique index -- see
+# MAX_LINEAGE_URI_LENGTH for why that matters.
+_WIDE_STRING_COLUMNS = frozenset({"source", "target"})
 
 
 def _validate_sql_identifier(name: str, identifier_type: str = "identifier") -> str:
@@ -289,6 +298,16 @@ class BaseSQLItemStorage(BaseItemStorage, Generic[BASE_ITEM_TYPE]):
             ):
                 # This one needs to be longer than 256, sometimes.
                 column = Column(String(1024), nullable=True, index=indexed)
+            elif lower_key in _WIDE_STRING_COLUMNS:
+                # Normalized lineage URIs. Exact-match, not a substring test, so
+                # only the two columns the graph traversal joins on are widened.
+                # Kept in lockstep with
+                # ``gbserver.storage.stored_lineage_row.MAX_LINEAGE_URI_LENGTH``,
+                # which drops an over-long URI before it reaches the DB -- a
+                # truncated URI would merge two distinct artifacts.
+                column = Column(
+                    String(MAX_LINEAGE_URI_LENGTH), nullable=True, index=indexed
+                )
             elif isinstance(value, str):
                 column = Column(String(256), nullable=True, index=indexed)
             elif isinstance(value, bool):

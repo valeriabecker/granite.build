@@ -30,8 +30,16 @@ fail here.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+from fastapi import HTTPException
+
 from gbserver.api import lineage as lineage_mod
-from gbserver.lineage.openlineage_models import ArtifactGraphRequest, TagSearchRequest
+from gbserver.lineage.openlineage_models import (
+    ArtifactGraphRequest,
+    LineageQueryRequest,
+    BuildGraphRequest,
+    TagSearchRequest,
+)
 
 MY_SPACE = "my-space"
 OTHER_SPACE = "other-space"
@@ -316,3 +324,602 @@ def test_get_artifact_graph_excludes_run_with_no_owner_or_namespace():
             ArtifactGraphRequest(artifact_name="dataset-x", direction="both"),
         )
     assert resp.runs == []
+
+
+# ---------------------------------------------------------------- build graph
+#
+# POST /lineage/build is DB-only and build-authorized, which is the opposite
+# shape from the routes above: the seed build is authorized once, up front, and
+# the walk is NOT re-authorized per expanded node. These tests pin that contract
+# -- the 501 narrowing, the seed-build check, and the conservative default scope
+# -- because each is a security-relevant default rather than a convenience.
+
+
+def _fake_build(uuid: str = "BLD", space_name: str = MY_SPACE):
+    """A real StoredBuild: the endpoint asserts the type before authorizing."""
+    from gbserver.storage.stored_build import StoredBuild
+
+    build = StoredBuild(
+        name="my-build",
+        space_name=space_name,
+        source_uri="git://example/repo",
+        username="member",
+    )
+    build.uuid = uuid
+    return build
+
+
+def _patch_build_lookup(build):
+    """Stand in for the admin storage's build lookup only."""
+    return patch.object(
+        lineage_mod,
+        "get_admin_storage",
+        return_value=SimpleNamespace(
+            build_storage=SimpleNamespace(get_by_uuid=lambda _uuid: build)
+        ),
+    )
+
+
+def _db_service(**kwargs):
+    """A stub that passes the endpoint's isinstance(DBLineageService) check."""
+    from gbserver.lineage.db_service import DBLineageService
+
+    service = DBLineageService.__new__(DBLineageService)
+    for name, value in kwargs.items():
+        setattr(service, name, value)
+    return service
+
+
+def test_build_graph_rejects_an_unknown_direction():
+    from fastapi import HTTPException
+    import pytest
+
+    with pytest.raises(HTTPException) as caught:
+        lineage_mod.get_build_graph(
+            _fake_request("member", "member@example.com"),
+            BuildGraphRequest(build_id="BLD", direction="sideways"),
+        )
+    assert caught.value.status_code == 400
+
+
+def test_build_graph_404s_for_a_missing_build():
+    from fastapi import HTTPException
+    import pytest
+
+    with _patch_build_lookup(None):
+        with pytest.raises(HTTPException) as caught:
+            lineage_mod.get_build_graph(
+                _fake_request("member", "member@example.com"),
+                BuildGraphRequest(build_id="NOPE"),
+            )
+    assert caught.value.status_code == 404
+
+
+def test_build_graph_501s_when_the_provider_is_not_database_backed():
+    """A build is a granite.build concept the external backends lack, so the
+    endpoint says so rather than inventing an empty graph."""
+    from fastapi import HTTPException
+    import pytest
+
+    with (
+        _patch_build_lookup(_fake_build()),
+        patch.object(lineage_mod, "authorize_build_read_access", return_value=None),
+        patch.object(
+            lineage_mod,
+            "_get_openlineage_service",
+            return_value=SimpleNamespace(),  # not a DBLineageService
+        ),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            lineage_mod.get_build_graph(
+                _fake_request("member", "member@example.com"),
+                BuildGraphRequest(build_id="BLD"),
+            )
+    assert caught.value.status_code == 501
+
+
+def test_build_graph_authorizes_the_seed_build():
+    """Authorization happens on the build, before any lineage is read."""
+    from fastapi import HTTPException
+    import pytest
+
+    def deny(_request, _build):
+        raise HTTPException(status_code=403, detail="nope")
+
+    called = []
+    service = _db_service(
+        get_build_graph=lambda **kw: called.append(kw) or {"root_id": "BLD"}
+    )
+    with (
+        _patch_build_lookup(_fake_build()),
+        patch.object(lineage_mod, "authorize_build_read_access", side_effect=deny),
+        patch.object(lineage_mod, "_get_openlineage_service", return_value=service),
+    ):
+        with pytest.raises(HTTPException) as caught:
+            lineage_mod.get_build_graph(
+                _fake_request("member", "member@example.com"),
+                BuildGraphRequest(build_id="BLD"),
+            )
+    assert caught.value.status_code == 403
+    assert called == [], "lineage must not be read when authorization fails"
+
+
+def test_build_graph_no_longer_takes_a_scope_flag():
+    """``within_build_only`` is gone, because the column it filtered on is gone.
+
+    It bounded the walk with ``WHERE build_id = ...``. A build is granite.build's own
+    process concept and is empty on every imported row, so the index does not model
+    it: a build-seeded graph resolves the build's artifacts through ``gb_targets``
+    and seeds the ordinary walk with their URIs. Scope is chosen by seeds now.
+
+    The authorization consequence is unchanged and still documented on the handler:
+    only the seed build is authorized, and expanded nodes are filtered by the
+    per-run space check rather than re-authorized per build.
+    """
+    assert "within_build_only" not in BuildGraphRequest.model_fields
+
+
+def test_build_graph_passes_the_direction_through():
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {"root_id": "BLD", "nodes": [], "edges": [], "truncated": False}
+
+    service = _db_service(get_build_graph=fake)
+    with (
+        _patch_build_lookup(_fake_build()),
+        patch.object(lineage_mod, "authorize_build_read_access", return_value=None),
+        patch.object(lineage_mod, "_get_openlineage_service", return_value=service),
+    ):
+        lineage_mod.get_build_graph(
+            _fake_request("member", "member@example.com"),
+            BuildGraphRequest(build_id="BLD", direction="downstream"),
+        )
+    assert seen["direction"] == "downstream"
+    assert seen["build_id"] == "BLD"
+
+
+def test_build_graph_returns_an_empty_graph_for_a_build_with_no_lineage():
+    """ "Nothing recorded" is a real answer, not a 404: the build ran, it just
+    produced and consumed no artifacts."""
+    service = _db_service(get_build_graph=lambda **_kw: None)
+    with (
+        _patch_build_lookup(_fake_build()),
+        patch.object(lineage_mod, "authorize_build_read_access", return_value=None),
+        patch.object(lineage_mod, "_get_openlineage_service", return_value=service),
+    ):
+        resp = lineage_mod.get_build_graph(
+            _fake_request("member", "member@example.com"),
+            BuildGraphRequest(build_id="BLD"),
+        )
+    assert resp.root_id == "BLD"
+    assert resp.nodes == []
+    assert resp.edges == []
+    assert resp.truncated is False
+
+
+def test_build_graph_carries_node_uris_through_to_the_response():
+    """The URI is how a caller locates the artifact -- a canonical identifier
+    does not encode the scheme, so it must survive into the response."""
+    graph = {
+        "root_id": "BLD",
+        "nodes": [
+            {
+                "id": "a1",
+                "node_type": "artifact",
+                "name": "raw",
+                "metadata": {"uri": "s3://bucket/raw"},
+            },
+            # Needs provenance: a run with neither namespace nor owner fails
+            # closed and is pruned, along with the artifacts only it touched.
+            _graph_node("run:J1", MY_SPACE, "someone_else@example.com", name="train"),
+        ],
+        "edges": [{"source": "a1", "target": "run:J1"}],
+        "truncated": True,
+    }
+    service = _db_service(get_build_graph=lambda **_kw: graph)
+    is_admin, is_member = _member_of(MY_SPACE)
+    with (
+        is_admin,
+        is_member,
+        _patch_build_lookup(_fake_build()),
+        patch.object(lineage_mod, "authorize_build_read_access", return_value=None),
+        patch.object(lineage_mod, "_get_openlineage_service", return_value=service),
+    ):
+        resp = lineage_mod.get_build_graph(
+            _fake_request("member", "member@example.com"),
+            BuildGraphRequest(build_id="BLD"),
+        )
+    assert resp.truncated is True
+    assert [n.id for n in resp.nodes] == ["a1", "run:J1"]
+    assert resp.nodes[0].metadata["uri"] == "s3://bucket/raw"
+    assert [(e.source, e.target) for e in resp.edges] == [("a1", "run:J1")]
+
+
+# --------------------------------------------------------------- POST/GET /graph
+
+
+def test_query_graph_rejects_an_unknown_direction():
+    with pytest.raises(HTTPException) as caught:
+        lineage_mod.query_lineage_graph(
+            _fake_request("member", "member@example.com"),
+            LineageQueryRequest(direction="sideways"),
+        )
+    assert caught.value.status_code == 400
+
+
+def test_query_graph_requires_the_db_provider():
+    """The external backends have no such query, so 501 rather than an empty answer."""
+    service = SimpleNamespace()  # not a DBLineageService
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        with pytest.raises(HTTPException) as caught:
+            lineage_mod.query_lineage_graph(
+                _fake_request("member", "member@example.com"),
+                LineageQueryRequest(uri="s3://b/x"),
+            )
+    assert caught.value.status_code == 501
+
+
+def test_query_graph_accepts_a_request_with_no_filters():
+    """An unfiltered query is legitimate: it means "show me recent activity"."""
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {"root_id": "", "nodes": [], "edges": [], "truncated": False}
+
+    service = _db_service(query_graph=fake)
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        resp = lineage_mod.query_lineage_graph(
+            _fake_request("member", "member@example.com"), LineageQueryRequest()
+        )
+    assert seen == {
+        "uri": None,
+        "job_id": None,
+        "direction": "both",
+        "max_depth": 10,
+    }
+    assert resp.root_id == ""
+    assert resp.nodes == []
+
+
+def test_query_graph_passes_every_filter_through():
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {"root_id": "s3://b/x", "nodes": [], "edges": [], "truncated": False}
+
+    service = _db_service(query_graph=fake)
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        lineage_mod.query_lineage_graph(
+            _fake_request("member", "member@example.com"),
+            LineageQueryRequest(
+                uri="s3://b/x", job_id="J1", direction="upstream", max_depth=3
+            ),
+        )
+    assert seen == {
+        "uri": "s3://b/x",
+        "job_id": "J1",
+        "direction": "upstream",
+        "max_depth": 3,
+    }
+
+
+def test_query_graph_does_not_404_on_an_empty_graph():
+    """"Nothing recorded" is a real answer and must not read as an error.
+
+    This is the difference from ``POST /artifact``, whose ``None`` becomes the 404 the
+    frontend renders as "lineage is not available".
+    """
+    service = _db_service(
+        query_graph=lambda **_kw: {
+            "root_id": "",
+            "nodes": [],
+            "edges": [],
+            "truncated": False,
+        }
+    )
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        resp = lineage_mod.query_lineage_graph(
+            _fake_request("member", "member@example.com"),
+            LineageQueryRequest(uri="s3://b/absent"),
+        )
+    assert resp.nodes == []
+
+
+def test_query_graph_carries_node_depth_to_the_response():
+    """``depth`` is the field a client needs to lay the graph out."""
+    service = _db_service(
+        query_graph=lambda **_kw: {
+            "root_id": "s3://b/x",
+            "nodes": [
+                {
+                    "id": "s3://b/x",
+                    "node_type": "artifact",
+                    "name": "x",
+                    "is_root": True,
+                    "depth": 0,
+                    "metadata": {"uri": "s3://b/x"},
+                },
+                {
+                    "id": "s3://b/y",
+                    "node_type": "artifact",
+                    "name": "y",
+                    "depth": 2,
+                    "metadata": {"uri": "s3://b/y"},
+                },
+                _graph_node("run:J1", MY_SPACE, "someone_else@example.com"),
+            ],
+            "edges": [
+                {"source": "s3://b/x", "target": "run:J1"},
+                {"source": "run:J1", "target": "s3://b/y"},
+            ],
+            "truncated": False,
+        }
+    )
+    is_admin, is_member = _member_of(MY_SPACE)
+    with (
+        is_admin,
+        is_member,
+        patch.object(lineage_mod, "_get_openlineage_service", return_value=service),
+    ):
+        resp = lineage_mod.query_lineage_graph(
+            _fake_request("member", "member@example.com"),
+            LineageQueryRequest(uri="s3://b/x"),
+        )
+    depths = {n.id: n.depth for n in resp.nodes if n.node_type == "artifact"}
+    assert depths == {"s3://b/x": 0, "s3://b/y": 2}
+
+
+def test_query_graph_get_form_maps_its_query_params():
+    """The GET form exists so a lineage view can be bookmarked and shared."""
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {"root_id": "", "nodes": [], "edges": [], "truncated": False}
+
+    service = _db_service(query_graph=fake)
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        lineage_mod.query_lineage_graph_get(
+            _fake_request("member", "member@example.com"),
+            uri="s3://b/x",
+            job_id="J1",
+            direction="downstream",
+            depth=4,
+        )
+    # note: the wire calls it `depth`, the service `max_depth`
+    assert seen["max_depth"] == 4
+    assert seen["direction"] == "downstream"
+    assert seen["uri"] == "s3://b/x"
+    assert seen["job_id"] == "J1"
+
+
+# --------------------------------------- the graph is cross-space, by decision
+
+
+def _two_space_graph() -> dict:
+    """A graph whose two runs live in different spaces.
+
+    ``mine`` produced ``a_mine``; ``theirs`` produced ``a_theirs`` and also consumed
+    ``a_shared``, which both runs touch.
+    """
+    return {
+        "root_id": "a_shared",
+        "nodes": [
+            {"id": "a_shared", "node_type": "artifact", "name": "shared", "depth": 0},
+            {"id": "a_mine", "node_type": "artifact", "name": "mine", "depth": 1},
+            {"id": "a_theirs", "node_type": "artifact", "name": "theirs", "depth": 1},
+            _graph_node("run:mine", MY_SPACE, "someone_else@example.com"),
+            _graph_node("run:theirs", OTHER_SPACE, "someone_else@example.com"),
+        ],
+        "edges": [
+            {"source": "a_shared", "target": "run:mine"},
+            {"source": "run:mine", "target": "a_mine"},
+            {"source": "a_shared", "target": "run:theirs"},
+            {"source": "run:theirs", "target": "a_theirs"},
+        ],
+        "truncated": False,
+    }
+
+
+def _query_graph_as_member_of(space: str, graph: dict):
+    service = _db_service(query_graph=lambda **_kw: graph)
+    is_admin, is_member = _member_of(space)
+    with (
+        is_admin,
+        is_member,
+        patch.object(lineage_mod, "_get_openlineage_service", return_value=service),
+    ):
+        return lineage_mod.query_lineage_graph(
+            _fake_request("member", "member@example.com"),
+            LineageQueryRequest(uri="a_shared"),
+        )
+
+
+def test_graph_is_not_filtered_per_space():
+    """The graph crosses spaces, and that is the decision -- not an oversight.
+
+    A lineage graph carries no access to any artifact: URIs, job names and edges
+    only. Filtering it would make "what was my model trained on?" silently
+    unanswerable whenever a chain crosses a space, which is the normal case for a
+    shared dataset or a platform base model.
+
+    This test exists so the behaviour cannot be changed by accident. Reversing it is a
+    product decision about whether artifact URIs are themselves secret -- see the
+    docstring on ``query_lineage_graph``.
+    """
+    resp = _query_graph_as_member_of(MY_SPACE, _two_space_graph())
+    ids = {n.id for n in resp.nodes}
+    assert {"a_shared", "a_mine", "a_theirs"} <= ids
+    assert {"run:mine", "run:theirs"} <= ids
+
+
+def test_graph_keeps_every_edge_regardless_of_space():
+    resp = _query_graph_as_member_of(MY_SPACE, _two_space_graph())
+    assert len(resp.edges) == 4
+
+
+def test_graph_provenance_is_complete_across_a_space_boundary():
+    """The use case the no-filtering decision protects.
+
+    A model in my space, trained on a dataset curated by another team: the upstream
+    chain must answer truthfully, or the index does not do its job.
+    """
+    graph = {
+        "root_id": "s3://mine/finetune",
+        "nodes": [
+            {
+                "id": "s3://mine/finetune",
+                "node_type": "artifact",
+                "name": "finetune",
+                "is_root": True,
+                "depth": 0,
+            },
+            {
+                "id": "s3://curated/corpus",
+                "node_type": "artifact",
+                "name": "corpus",
+                "depth": 1,
+            },
+            _graph_node("run:platform", "platform-team", "other@example.com"),
+        ],
+        "edges": [
+            {"source": "s3://curated/corpus", "target": "run:platform"},
+            {"source": "run:platform", "target": "s3://mine/finetune"},
+        ],
+        "truncated": False,
+    }
+    resp = _query_graph_as_member_of(MY_SPACE, graph)
+    depths = {n.id: n.depth for n in resp.nodes if n.node_type == "artifact"}
+    assert depths == {"s3://mine/finetune": 0, "s3://curated/corpus": 1}
+
+
+def test_graph_keeps_a_run_with_no_provenance():
+    """No space check means an unattributed run is not dropped either.
+
+    ``POST /artifact`` and ``POST /search`` fail closed on a run with neither
+    namespace nor owner because they authorize per run. This route does not authorize
+    per node at all, so there is nothing to fail closed about -- worth pinning, since
+    the two routes now differ.
+    """
+    graph = {
+        "root_id": "a1",
+        "nodes": [
+            {"id": "a1", "node_type": "artifact", "name": "a"},
+            {"id": "run:anon", "node_type": "run", "name": "anon", "metadata": {}},
+        ],
+        "edges": [{"source": "a1", "target": "run:anon"}],
+        "truncated": False,
+    }
+    resp = _query_graph_as_member_of(MY_SPACE, graph)
+    assert {n.id for n in resp.nodes} == {"a1", "run:anon"}
+
+
+def test_artifact_graph_still_filters_per_space():
+    """The contrast: POST /artifact DOES filter, and must keep doing so.
+
+    It re-projects into run-centred entries and has always applied the per-run space
+    check. Only the node/edge routes are cross-space, so a change to one must not be
+    assumed to apply to the other.
+    """
+    my_run = _graph_node("run:mine", MY_SPACE, "someone_else@example.com")
+    other_run = _graph_node("run:theirs", OTHER_SPACE, "someone_else@example.com")
+    fake_service = SimpleNamespace(
+        get_artifact_graph=lambda **_kw: {
+            "root_id": "a1",
+            "nodes": [
+                {"id": "a1", "node_type": "artifact", "name": "a"},
+                my_run,
+                other_run,
+            ],
+            "edges": [
+                {"source": "a1", "target": "run:mine"},
+                {"source": "a1", "target": "run:theirs"},
+            ],
+            "truncated": False,
+        }
+    )
+    is_admin, is_member = _member_of(MY_SPACE)
+    with (
+        is_admin,
+        is_member,
+        patch.object(
+            lineage_mod, "_get_openlineage_service", return_value=fake_service
+        ),
+    ):
+        resp = lineage_mod.get_artifact_graph(
+            _fake_request("member", "member@example.com"),
+            ArtifactGraphRequest(artifact_url="a1"),
+        )
+    assert [r.job_namespace.split("/", 1)[0] for r in resp.runs] == [MY_SPACE]
+
+
+# ----------------------------------------------------------- GET /lineage/runs
+
+
+def test_runs_requires_a_uri_or_a_job_id():
+    with pytest.raises(HTTPException) as caught:
+        lineage_mod.list_lineage_runs(_fake_request("member", "member@example.com"))
+    assert caught.value.status_code == 400
+
+
+def test_runs_requires_the_db_provider():
+    service = SimpleNamespace()  # not a DBLineageService
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        with pytest.raises(HTTPException) as caught:
+            lineage_mod.list_lineage_runs(
+                _fake_request("member", "member@example.com"), uri="s3://b/x"
+            )
+    assert caught.value.status_code == 501
+
+
+def test_runs_passes_its_paging_through():
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return {"runs": [], "total": 0, "limit": 25, "offset": 50}
+
+    service = _db_service(list_runs=fake)
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        resp = lineage_mod.list_lineage_runs(
+            _fake_request("member", "member@example.com"),
+            uri="s3://b/x",
+            limit=25,
+            offset=50,
+        )
+    assert seen == {"uri": "s3://b/x", "job_id": None, "limit": 25, "offset": 50}
+    assert resp.limit == 25
+    assert resp.offset == 50
+
+
+def test_runs_reports_the_total_so_a_caller_can_page():
+    """The count is what makes a collapsed graph node expandable."""
+    service = _db_service(
+        list_runs=lambda **_kw: {
+            "runs": [
+                {
+                    "job_id": "J1",
+                    "source": "s3://b/x",
+                    "target": "s3://b/x",
+                    "is_self_loop": True,
+                    "job": {"name": "append"},
+                    "source_system": "lakehouse",
+                }
+            ],
+            "total": 68906,
+            "limit": 1,
+            "offset": 0,
+        }
+    )
+    with patch.object(lineage_mod, "_get_openlineage_service", return_value=service):
+        resp = lineage_mod.list_lineage_runs(
+            _fake_request("member", "member@example.com"), uri="s3://b/x"
+        )
+    assert resp.total == 68906
+    assert len(resp.runs) == 1
+    assert resp.runs[0].is_self_loop is True
+    assert resp.runs[0].job["name"] == "append"

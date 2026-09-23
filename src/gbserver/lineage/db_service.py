@@ -37,12 +37,26 @@ index by identifier in the first place.
 """
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from gbserver.lineage.graph_builder import build_graph_dict
 from gbserver.lineage.openlineage_service import LineageService
-from gbserver.lineage.walk import DEFAULT_MAX_NODES_PER_LEVEL, Direction, walk_lineage
+from gbserver.lineage.attributes import (
+    SOURCE,
+    TARGET,
+    endpoint_kind,
+    job_detail,
+    origin_system,
+)
+from gbserver.lineage.uri_normalize import normalize_uri
+from gbserver.lineage.walk import (
+    DEFAULT_MAX_NODES_PER_LEVEL,
+    Direction,
+    LineageGraph,
+    walk_lineage,
+)
 from gbserver.storage.lineage_row_storage import ILineageRowStorage
+from gbserver.storage.stored_lineage_row import TERMINAL
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +65,16 @@ logger = logging.getLogger(__name__)
 # easy to invert by accident: the prototype's "downstream" walks toward origins,
 # but the live W&B backend treats downstream as used_by() -- toward descendants --
 # and the frontend sends it with that meaning. This follows the live backend.
+# How many of the newest rows seed an unfiltered query. A graph of "everything" is
+# neither useful nor bounded, so the newest activity stands in for it.
+_RECENT_ACTIVITY_ROWS = 50
+
+# Ceiling on one page of the run listing. Generous, because the rows are small and the
+# whole point of the endpoint is to make a 68,905-run artifact reachable -- but bounded,
+# so a caller cannot ask for all of them in one response and recreate the problem the
+# graph collapse exists to avoid.
+_MAX_RUNS_PAGE = 1000
+
 _WIRE_DIRECTIONS = {
     "downstream": Direction.DESCENDANTS,
     "upstream": Direction.ANCESTORS,
@@ -65,10 +89,19 @@ class DBLineageService(LineageService):
         storage: the lineage row storage to read. Defaults to the process-wide
             admin storage, resolved lazily so importing this module does not
             require a configured database.
+        admin_storage: the admin storage used to resolve a *build* into the
+            artifacts it touched. Only the build-seeded path needs it -- the index
+            itself has no notion of a build -- so it is separate from ``storage``
+            and likewise resolved lazily.
     """
 
-    def __init__(self, storage: Optional[ILineageRowStorage] = None) -> None:
+    def __init__(
+        self,
+        storage: Optional[ILineageRowStorage] = None,
+        admin_storage: Optional[object] = None,
+    ) -> None:
         self._storage = storage
+        self._admin = admin_storage
 
     @property
     def storage(self) -> ILineageRowStorage:
@@ -89,12 +122,16 @@ class DBLineageService(LineageService):
     ) -> Optional[Dict]:
         """Return the lineage graph for one artifact, or ``None`` if unknown.
 
+        The root resolves in **one indexed lookup**. This used to be a paged full
+        scan of the table on every request, and not by oversight: the indexed
+        columns held canonical identifiers while a request carries a URL, so there
+        was nothing to match on. With the URI as the identity, normalizing the
+        request's URL produces exactly the value those columns hold.
+
         Args:
-            artifact_name: the artifact's name, matched against rows' promoted
-                name columns and against canonical identifiers.
-            artifact_url: the artifact's URI, matched against rows' stored URIs.
-                The more precise of the two: a URI identifies one artifact, a name
-                may not.
+            artifact_name: the artifact's name. Only usable as a URI -- see below.
+            artifact_url: the artifact's URI, in any spelling; it is normalized
+                here, so a browser URL and the runtime's own URI resolve alike.
             artifact_type: when given, the resolved root must have this type, and a
                 mismatch is an error rather than a miss -- the caller asserted
                 something about the artifact that turned out to be false.
@@ -102,11 +139,11 @@ class DBLineageService(LineageService):
             direction: ``downstream``, ``upstream`` or ``both``, in wire terms.
 
         Returns:
-            ``{root_id, nodes, edges, truncated}``, or ``None`` when no row
-            mentions the artifact. ``None`` becomes the 404 the frontend shows as
-            "not available", so it must mean "unknown here", never "no lineage":
-            an artifact that IS in the index but has no edges yet returns a graph
-            with just its own node.
+            ``{root_id, nodes, edges, truncated}``, or ``None`` when the request
+            names nothing this index can key on. ``None`` becomes the 404 the
+            frontend shows as "not available", so it must mean "unknown here", never
+            "no lineage": an artifact that normalizes fine but has no edges yet
+            returns a graph with just its own node.
 
         Raises:
             ValueError: if ``direction`` is not a wire direction, or if
@@ -119,54 +156,321 @@ class DBLineageService(LineageService):
                 f"direction must be one of {sorted(_WIRE_DIRECTIONS)}, got {direction!r}"
             )
 
-        root = self._resolve_root(artifact_name, artifact_url)
-        if root is None:
+        # A name is not an identity. The index keys on URIs, and a bare name has no
+        # scheme, so it can only be resolved if it already *is* one -- which is why
+        # the URL is tried first and a name is only a fallback for a caller that
+        # passed a URI in the name field. Guessing a scheme for a bare name would
+        # invent an artifact that may not exist.
+        root_uri = normalize_uri(artifact_url or "") or normalize_uri(
+            artifact_name or ""
+        )
+        if not root_uri:
             return None
-        root_identifier, root_uri, root_kind = root
-
-        if artifact_type and root_kind and artifact_type != root_kind:
-            raise ValueError(
-                f"Artifact type mismatch: expected {artifact_type!r}, but "
-                f"{root_identifier!r} has type {root_kind!r}"
-            )
 
         graph = walk_lineage(
             storage=self.storage,
-            seeds=[root_identifier],
+            seeds=[root_uri],
             direction=walk_direction,
             max_depth=max_depth,
             max_nodes_per_level=DEFAULT_MAX_NODES_PER_LEVEL,
         )
-        return build_graph_dict(graph, root_identifier, root_uri=root_uri)
+
+        if artifact_type:
+            root_kind = self._kind_of(graph, root_uri)
+            if root_kind and artifact_type != root_kind:
+                raise ValueError(
+                    f"Artifact type mismatch: expected {artifact_type!r}, but "
+                    f"{root_uri!r} has type {root_kind!r}"
+                )
+
+        return build_graph_dict(graph, root_uri=root_uri)
+
+    @staticmethod
+    def _kind_of(graph, uri: str) -> str:
+        """The artifact type recorded for ``uri`` in a walked graph, if any.
+
+        A URI has one type by decision, so the first row mentioning it settles the
+        answer and there is nothing to reconcile.
+        """
+        for row in graph.rows:
+            if row.source == uri:
+                kind = endpoint_kind(row.attributes, SOURCE)
+                if kind:
+                    return kind
+            if row.target == uri:
+                kind = endpoint_kind(row.attributes, TARGET)
+                if kind:
+                    return kind
+        return ""
+
+    def query_graph(
+        self,
+        uri: Optional[str] = None,
+        job_id: Optional[str] = None,
+        direction: str = "both",
+        max_depth: int = 10,
+    ) -> Dict:
+        """Return a lineage graph for any combination of optional filters.
+
+        The general entry point: a caller asks however it holds the artifact, rather
+        than the index dictating one lookup shape.
+
+        - ``uri`` -- seeds from that artifact, in any spelling.
+        - ``job_id`` -- seeds from every endpoint of that execution.
+        - both -- seeds from the union, so a job's inputs and one specific artifact
+          can be expanded together.
+        - neither -- seeds from the most recent lineage activity, capped.
+
+        Never returns ``None``: unlike :meth:`get_artifact_graph` there is nothing to
+        report as "unknown", because a query with no filters is a legitimate request
+        and an empty index is a legitimate answer. An empty graph means "nothing
+        recorded", which the caller must not render as an error.
+
+        Args:
+            uri: the artifact's URI, normalized here.
+            job_id: the job execution to seed from.
+            direction: ``downstream``, ``upstream`` or ``both``, in wire terms.
+            max_depth: how many hops to expand beyond the seeds.
+
+        Returns:
+            ``{root_id, nodes, edges, truncated}``. ``root_id`` is the resolved URI
+            when exactly one artifact was named, else ``""``: a job-seeded or
+            unfiltered query has several roots, and flagging one arbitrarily would
+            misreport what was asked about.
+
+        Raises:
+            ValueError: if ``direction`` is not a wire direction. The API layer maps
+                this to a 400.
+        """
+        walk_direction = _WIRE_DIRECTIONS.get(direction)
+        if walk_direction is None:
+            raise ValueError(
+                f"direction must be one of {sorted(_WIRE_DIRECTIONS)}, got {direction!r}"
+            )
+
+        root_uri = normalize_uri(uri or "")
+        seeds: set = set()
+        if root_uri:
+            seeds.add(root_uri)
+        if job_id:
+            seeds.update(self._job_endpoint_uris(job_id))
+
+        if not seeds:
+            if uri or job_id:
+                # The caller named something this index cannot key on. An empty graph
+                # rather than an error: "nothing matches" is a real answer, and the
+                # URI drop is already logged by normalize_uri.
+                return build_graph_dict(LineageGraph(), root_uri=root_uri)
+            seeds = self._recent_activity_seeds()
+
+        graph = walk_lineage(
+            storage=self.storage,
+            seeds=seeds,
+            direction=walk_direction,
+            max_depth=max_depth,
+            max_nodes_per_level=DEFAULT_MAX_NODES_PER_LEVEL,
+        )
+        # Only a single-artifact query has one root to flag; anything else has many.
+        single_root = bool(root_uri) and not job_id
+        return build_graph_dict(
+            graph, root_uri=root_uri, root_is_artifact=single_root
+        )
+
+    def list_runs(
+        self,
+        uri: Optional[str] = None,
+        job_id: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict:
+        """List the job executions touching an artifact, paged.
+
+        The drill-down the graph deliberately does not carry. ``build_graph_dict``
+        collapses an artifact's in-place rewrites into one node with a ``run_count``,
+        because rendering 68,905 of them produced a 55 MB response describing a single
+        dataset -- and a count with no way to expand it would just be a dead end. This
+        is that way.
+
+        Paged rather than capped: unlike the graph, a flat list has no shape to
+        preserve, so there is no reason to truncate it instead of letting a caller walk
+        it.
+
+        Args:
+            uri: the artifact whose runs to list, in any spelling; normalized here.
+                Matches a run that consumed it OR produced it.
+            job_id: list the rows of one execution instead.
+            limit: page size, capped at :data:`_MAX_RUNS_PAGE`.
+            offset: rows to skip.
+
+        Returns:
+            ``{runs, total, limit, offset}``. ``runs`` carries one entry per row, each
+            with its job id, endpoints and job detail.
+
+            ``total`` is exact, from three indexed SQL counts: rows with this artifact
+            as source, plus as target, minus the self-loops that are both (without that
+            third term an in-place-rewritten artifact reports double).
+        """
+        limit = max(1, min(int(limit), _MAX_RUNS_PAGE))
+        offset = max(0, int(offset))
+
+        if job_id:
+            rows = self._safe(lambda: self.storage.get_rows_by_job(job_id))
+            return {
+                "runs": [_run_entry(row) for row in rows[offset : offset + limit]],
+                "total": len(rows),
+                "limit": limit,
+                "offset": offset,
+            }
+
+        normalized = normalize_uri(uri or "")
+        if not normalized:
+            return {"runs": [], "total": 0, "limit": limit, "offset": offset}
+
+        # Both directions, because "the runs touching this artifact" means the ones
+        # that consumed it and the ones that produced it.
+        wheres = ({"source": normalized}, {"target": normalized})
+
+        # The total comes from SQL COUNT, not from walking the rows. An artifact with
+        # 68,905 runs is exactly the case this endpoint exists for, and counting it in
+        # Python cost ~3s per request whatever the page size -- recreating in the read
+        # path the expense the graph collapse removed.
+        #
+        # Three counts, not two: a self-loop row matches BOTH the source and the target
+        # query, so summing them double-counts every in-place rewrite. On the real hub
+        # that reported 137,811 runs for an artifact with 68,906 -- a number wrong by
+        # 2x, which is worse than slow. Subtracting the overlap makes it exact and still
+        # costs only one more indexed COUNT.
+        total = (
+            self._safe_count({"source": normalized})
+            + self._safe_count({"target": normalized})
+            - self._safe_count({"source": normalized, "target": normalized})
+        )
+
+        # Streamed, and stopped as soon as the window is filled: pages are pulled only
+        # until the requested slice exists, so an early offset costs an early exit.
+        seen: set = set()
+        page: List = []
+        position = 0
+        for where in wheres:
+            if len(page) >= limit:
+                break
+            for chunk in self._safe_pages(where):
+                for row in chunk:
+                    key = (row.job_id, row.source, row.target)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if position >= offset:
+                        page.append(row)
+                    position += 1
+                    if len(page) >= limit:
+                        break
+                if len(page) >= limit:
+                    break
+
+        return {
+            "runs": [_run_entry(row) for row in page],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def _safe_count(self, where: Dict) -> int:
+        """Count matching rows in SQL, reporting a failure as zero."""
+        try:
+            return int(self.storage.count(where))
+        except Exception:
+            logger.exception("Lineage run count query failed")
+            return 0
+
+    def _safe_pages(self, where: Dict) -> Iterator[List]:
+        """Yield pages for a where clause, reporting a failure as "no more".
+
+        A failed read must not turn a listing into a 500; the caller sees a smaller
+        total and the exception is logged.
+        """
+        try:
+            yield from self.storage.get_paged(where)
+        except Exception:
+            logger.exception("Lineage run listing query failed")
+
+    @staticmethod
+    def _safe(fetch) -> List:
+        """Run a storage read, reporting a failure as "nothing" rather than raising.
+
+        One failed page must not turn a listing into a 500; the caller sees a smaller
+        total, and the exception is logged.
+        """
+        try:
+            return list(fetch())
+        except Exception:
+            logger.exception("Lineage run listing query failed")
+            return []
+
+    def _job_endpoint_uris(self, job_id: str) -> set:
+        """Every endpoint of one job execution, as seeds.
+
+        One indexed query on ``job_id``, which is the only identifier every lineage
+        source has -- so this works for imported rows too, where no process id does.
+        """
+        try:
+            rows = self.storage.get_rows_by_job(job_id)
+        except Exception:
+            logger.exception("Could not read rows for job %s", job_id)
+            return set()
+        seeds: set = set()
+        for row in rows:
+            for endpoint in (row.source, row.target):
+                if endpoint and endpoint != TERMINAL:
+                    seeds.add(endpoint)
+        return seeds
+
+    def _recent_activity_seeds(self) -> set:
+        """Seeds for an unfiltered query: the most recently recorded endpoints.
+
+        Deliberately capped and taken from the first page only. "Everything" is not a
+        useful answer for a graph and would be an unbounded walk; the newest rows are
+        what an operator opening an empty view actually wants to see.
+        """
+        try:
+            for page in self.storage.get_paged():
+                seeds: set = set()
+                for row in page[:_RECENT_ACTIVITY_ROWS]:
+                    for endpoint in (row.source, row.target):
+                        if endpoint and endpoint != TERMINAL:
+                            seeds.add(endpoint)
+                return seeds
+        except Exception:
+            logger.exception("Could not read recent lineage activity")
+        return set()
 
     def get_build_graph(
         self,
         build_id: str,
         direction: str = "both",
         max_depth: int = 10,
-        within_build_only: bool = False,
     ) -> Optional[Dict]:
         """Return the lineage graph seeded from every artifact a build touched.
 
-        A build is not a graph node; it is a way to *seed* one. One indexed query
-        gets the build's rows, their endpoints become the seed set, and the walk is
-        the ordinary one from there -- no separate traversal.
+        A build is not a node in this index, and it is not a column either: a build
+        is granite.build's own process concept, absent from every imported row, so
+        indexing it would index blanks over most of the table. It is resolved
+        *outside* the index instead -- the build's target runs name their input and
+        output artifacts, those artifacts have URIs, and those URIs seed the ordinary
+        walk. One extra query buys an index that stays portable to a source with
+        pipelines, DAG runs, or no such concept at all.
 
         Args:
             build_id: the build to seed from.
             direction: ``downstream``, ``upstream`` or ``both``, in wire terms.
             max_depth: how many hops to expand beyond the seeds.
-            within_build_only: keep the walk inside this build's own rows. Both
-                scopes are useful -- the build's internal graph, or the full chain
-                it sits in -- so this is a filter on one walk rather than a second
-                implementation.
 
         Returns:
             ``{root_id, nodes, edges, truncated}`` with ``root_id`` set to
-            ``build_id``, or ``None`` when the build has no rows. ``root_id`` names
-            no artifact node here, so nothing is flagged ``is_root``: a build's
-            graph has several roots, and picking one arbitrarily would misreport
-            which artifact was asked about.
+            ``build_id``, or ``None`` when the build touched no resolvable artifact.
+            ``root_id`` names no artifact node here, so nothing is flagged
+            ``is_root``: a build's graph has several roots, and picking one
+            arbitrarily would misreport which artifact was asked about.
 
         Raises:
             ValueError: if ``direction`` is not a wire direction.
@@ -179,90 +483,77 @@ class DBLineageService(LineageService):
         if not build_id:
             return None
 
-        rows = self.storage.get_rows_by_build(build_id)
-        if not rows:
+        seeds = self._build_seed_uris(build_id)
+        if not seeds:
             return None
 
-        seeds = {row.source for row in rows} | {row.target for row in rows}
         graph = walk_lineage(
             storage=self.storage,
             seeds=seeds,
             direction=walk_direction,
             max_depth=max_depth,
-            build_id=build_id if within_build_only else None,
+            max_nodes_per_level=DEFAULT_MAX_NODES_PER_LEVEL,
         )
-        return build_graph_dict(graph, root_identifier=build_id, root_is_artifact=False)
+        return build_graph_dict(graph, root_uri=build_id, root_is_artifact=False)
 
-    def _resolve_root(
-        self,
-        artifact_name: Optional[str],
-        artifact_url: Optional[str],
-    ) -> Optional[Tuple[str, str, str]]:
-        """Find the canonical identifier of the artifact a request names.
+    def _build_seed_uris(self, build_id: str) -> set:
+        """Normalized URIs of every artifact a build's target runs touched.
 
-        Resolution is by lookup, not by construction: an identifier needs a
-        namespace and a type that the request does not carry, so building one from
-        a bare name would guess. Matching against rows also means an artifact is
-        findable by whatever its source recorded, including an imported one with no
-        uuid.
+        Reads granite.build's own tables, not the lineage index: this is the seam
+        that keeps the index generic, resolving the build concept here so it never
+        reaches the schema.
 
-        Order matters. A URI identifies exactly one artifact; a name may match
-        several, so the URI is tried first and the name is a fallback.
+        It derives the endpoints through the **shared event builder**, the same one
+        the write sink and ``GET /lineage/build/{id}`` use, rather than walking
+        ``input_artifacts``/``output_artifacts`` and resolving uuids itself. Those
+        would be two pieces of code answering one question -- "which artifacts did
+        this build touch" -- free to disagree about an artifact-less target or an
+        unresolvable uuid. Going through the builder means a build's seeds are by
+        construction the endpoints its lineage rows were written from, so a graph
+        cannot be seeded from a set the writer never saw.
 
-        Args:
-            artifact_name: the name to match, if any.
-            artifact_url: the URI to match, if any.
-
-        Returns:
-            ``(identifier, uri, kind)`` for the resolved root, or ``None`` if no row
-            mentions it. ``uri`` and ``kind`` come from the matched row so the
-            caller need not re-derive them.
-        """
-        if artifact_url:
-            found = self._match_rows(lambda row: _endpoints_by_uri(row, artifact_url))
-            if found is not None:
-                return found
-
-        if artifact_name:
-            exact = self._match_rows(
-                lambda row: _endpoints_by_identifier(row, artifact_name)
-            )
-            if exact is not None:
-                return exact
-            return self._match_rows(lambda row: _endpoints_by_name(row, artifact_name))
-
-        return None
-
-    def _match_rows(self, matcher: Callable) -> Optional[Tuple[str, str, str]]:
-        """Scan rows for an endpoint a matcher accepts.
-
-        A scan, deliberately, and only on the root lookup: the columns that would
-        make this indexed are ``source``/``target``, which hold canonical
-        identifiers, and the request does not carry one to match on. Every hop
-        *after* the root is a single indexed query, so this happens once per
-        request rather than per level.
-
-        Paged rather than loaded whole, and it returns at the first match, so the
-        cost is bounded by where the match falls instead of by the table size.
-
-        Args:
-            matcher: called with a row; returns ``(identifier, uri, kind)`` for a
-                matching endpoint, or ``None``.
-
-        Returns:
-            The first match, or ``None``. A storage failure is logged and reported
-            as "not found": the caller turns that into a 404, which is the same
-            thing the frontend already shows when lineage is unavailable.
+        An endpoint whose URI does not normalize is skipped rather than guessed. A
+        missing seed costs part of a graph; an invented one invents provenance.
         """
         try:
-            for page in self.storage.get_paged():
-                for row in page:
-                    matched = matcher(row)
-                    if matched is not None:
-                        return matched
+            storage = self._admin_storage()
+            targets = storage.target_storage.get_by_where({"build_id": build_id})
         except Exception:
-            logger.exception("Lineage root lookup failed")
-        return None
+            logger.exception("Could not read target runs for build %s", build_id)
+            return set()
+        if not targets:
+            return set()
+
+        from gbserver.lineage.db_jobstats import DBLineageStore
+
+        builder = DBLineageStore(storage=self.storage)
+        seeds: set = set()
+        for target in targets:
+            try:
+                events, _ = builder.create_jobstats_for_target(storage, target)
+            except Exception:
+                # One unbuildable target must not cost the whole graph; the others
+                # still seed it.
+                logger.debug(
+                    "Could not build events for target %s",
+                    getattr(target, "uuid", "?"),
+                )
+                continue
+            for event in events:
+                seeds.update(_event_endpoint_uris(event))
+        return seeds
+
+    def _admin_storage(self):
+        """The admin storage used to resolve a build, resolved on first use.
+
+        Imported inside the function so importing this module does not require a
+        configured database.
+        """
+        if self._admin is None:
+            from gbserver.storage.singleton_storage import get_admin_storage
+
+            self._admin = get_admin_storage()
+        return self._admin
 
     # -- Write-path methods. This service reads an index that another writer
     # populates, so none of these apply; each returns the value that makes a caller
@@ -316,37 +607,36 @@ class DBLineageService(LineageService):
         return target_ids
 
 
-def _endpoints_by_uri(row, uri: str) -> Optional[Tuple[str, str, str]]:
-    """Match a row endpoint by its stored URI."""
-    if row.source_uri and row.source_uri == uri:
-        return row.source, row.source_uri, row.source_kind
-    if row.target_uri and row.target_uri == uri:
-        return row.target, row.target_uri, row.target_kind
-    return None
+def _event_endpoint_uris(event: dict) -> set:
+    """Normalized URIs of an event's source and target artifacts.
 
-
-def _endpoints_by_identifier(row, identifier: str) -> Optional[Tuple[str, str, str]]:
-    """Match a row endpoint by canonical identifier.
-
-    Lets a caller that already has an identifier -- a link built from a previous
-    graph response -- pass it as the name and get an exact hit.
+    Reuses ``decompose``'s URI accessor so the seeds are read from an artifact dict
+    exactly as the writer reads them -- including its three-key fallback, since
+    producers disagree on whether the URI sits at the top level or in the facets.
     """
-    if row.source == identifier:
-        return row.source, row.source_uri, row.source_kind
-    if row.target == identifier:
-        return row.target, row.target_uri, row.target_kind
-    return None
+    from gbserver.lineage.decompose import _artifact_uri, _normalized_job_keys
+
+    uris: set = set()
+    for key in _normalized_job_keys():
+        for artifact in event.get(key) or []:
+            uri = normalize_uri(_artifact_uri(artifact))
+            if uri:
+                uris.add(uri)
+    return uris
 
 
-def _endpoints_by_name(row, name: str) -> Optional[Tuple[str, str, str]]:
-    """Match a row endpoint by its promoted name column.
+def _run_entry(row) -> Dict:
+    """One row of a run listing.
 
-    The loosest match, and last: a name is not unique across namespaces, so this
-    can resolve to one of several artifacts. It is still worth having, because a UI
-    that only knows a display name has nothing else to ask with.
+    Flat and endpoint-first: a caller reaching here already has the artifact and wants
+    to know which executions touched it, so the job detail matters more than the graph
+    shape. Terminals are reported as empty strings, exactly as stored.
     """
-    if row.source_name and row.source_name == name:
-        return row.source, row.source_uri, row.source_kind
-    if row.target_name and row.target_name == name:
-        return row.target, row.target_uri, row.target_kind
-    return None
+    return {
+        "job_id": row.job_id,
+        "source": row.source,
+        "target": row.target,
+        "is_self_loop": row.is_self_loop(),
+        "job": job_detail(row.attributes),
+        "source_system": origin_system(row.attributes),
+    }

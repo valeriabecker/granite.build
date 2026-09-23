@@ -54,7 +54,6 @@ def reference_walk(
     direction: Direction,
     max_depth: int,
     max_nodes_per_level: Optional[int] = None,
-    build_id: Optional[str] = None,
 ) -> tuple:
     """Re-derive the reachable subgraph from a full row list.
 
@@ -66,14 +65,11 @@ def reference_walk(
         direction: which way to walk.
         max_depth: level limit.
         max_nodes_per_level: optional frontier ceiling.
-        build_id: optional build scope.
 
     Returns:
         ``(row_keys, depths, truncated)`` -- the row identity tuples reached, the
         node -> shortest-depth map, and whether a limit stopped the walk.
     """
-    if build_id is not None:
-        rows = [r for r in rows if r.build_id == build_id]
 
     # Adjacency built explicitly, both ways, before any walking happens.
     out_edges: dict = {}

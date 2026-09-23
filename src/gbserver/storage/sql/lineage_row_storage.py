@@ -35,19 +35,27 @@ class SQLLineageRowStorage(
 
     - ``source`` / ``target`` carry the graph traversal. Every hop is
       ``WHERE source IN (frontier)`` or ``WHERE target IN (frontier)``, so without
-      these two indexes a walk degrades to a full scan per level. The prototype
-      indexes exactly these.
+      these two indexes a walk degrades to a full scan per level. They hold
+      normalized URIs, which is also what makes the *root* lookup an index seek:
+      a request names an artifact by URI, so there is finally something indexed to
+      match it against.
     - ``job_id`` groups the rows of one execution, which is what makes an N*M
-      decomposition regroupable. The prototype joins and groups on it but leaves it
+      decomposition regroupable, and it also backs the sink's presence-based dedup,
+      run on every scan. The prototype joins and groups on it but leaves it
       unindexed -- a gap corrected here.
-    - ``target_run_uuid`` backs the sink's presence-based dedup, run on every scan.
-    - ``build_id`` seeds a build-scoped graph with one query instead of loading the
-      build's target runs.
-    - ``source_system`` scopes the rebuild delete.
 
-    ``derivable`` is promoted but deliberately not indexed: it is a bool, only ever
-    compared for equality in the rebuild, and never batched -- a list against a
-    non-string column silently degrades to ``column == [list]``.
+    There is deliberately no ``build_id`` or ``target_run_uuid`` column. Those are
+    granite.build's process concepts, empty on every imported row, so indexing them
+    would index blanks for most of the table. A caller wanting a process-scoped view
+    resolves that scope in its own system and seeds the walk with the resulting
+    URIs, which keeps this index answering exactly one question: what is the lineage
+    of this artifact.
+
+    Every indexed column is text. ``get_by_where`` builds an ``IN`` clause only for
+    string-typed columns and silently degrades to ``column == [list]`` otherwise, so
+    a non-text indexed column is a latent wrong-results bug rather than merely a
+    slow one. ``source_system`` lives in the JSON blob rather than in a column: it is
+    read to label a run node, never to filter one.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -55,9 +63,6 @@ class SQLLineageRowStorage(
             "source",
             "target",
             "job_id",
-            "target_run_uuid",
-            "build_id",
-            "source_system",
         ]
         # One row per (job, input, output). A second source reporting the same
         # relation is a no-op, which is what makes re-ingest idempotent -- a
@@ -68,7 +73,10 @@ class SQLLineageRowStorage(
         # terminals: in SQL, NULL never equals NULL, so NULL endpoints would slip
         # past this index and leave creation/deletion rows unprotected. Note also
         # that unique indexes are only created with the table, so this cannot be
-        # added later without recreating it.
+        # added later without recreating it -- and that __create_unique_indexes
+        # only *warns* on failure, so an index too wide for the backend's key
+        # limit costs idempotence silently. That is why the URI columns are 512
+        # and not 1024 (see MAX_LINEAGE_URI_LENGTH).
         kwargs["unique_columns"] = {("job_id", "source", "target"): None}
         kwargs["autoincr_column"] = "index"
         kwargs["default_pagination_sort_by_column"] = "index"

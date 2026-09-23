@@ -39,25 +39,18 @@ class ILineageRowStorage(IItemStorage[StoredLineageRow]):
         """Return rows whose ``target`` is one of ``targets`` (ancestor hop)."""
         raise NotImplementedError
 
-    def get_rows_by_build(self, build_id: str) -> List[StoredLineageRow]:
-        """Return every row recorded for one build."""
-        raise NotImplementedError
-
     def get_rows_by_job(self, job_id: str) -> List[StoredLineageRow]:
         """Return every row of one job execution."""
         raise NotImplementedError
 
-    def has_rows_for_target_run(self, target_run_uuid: str) -> bool:
-        """Whether any row is already recorded for a target run."""
+    def has_rows_for_job(self, job_id: str) -> bool:
+        """Whether any row is already recorded for a job."""
         raise NotImplementedError
 
-    def get_recorded_target_runs(self, target_run_uuids: List[str]) -> set:
-        """Return which of ``target_run_uuids`` already have rows."""
+    def get_recorded_jobs(self, job_ids: List[str]) -> set:
+        """Return which of ``job_ids`` already have rows."""
         raise NotImplementedError
 
-    def delete_derivable_rows(self, source_system: str) -> int:
-        """Delete re-derivable rows of one source system. Returns the count."""
-        raise NotImplementedError
 
 
 class BaseLineageRowStorage(BaseItemStorage[StoredLineageRow], ILineageRowStorage):
@@ -80,35 +73,17 @@ class BaseLineageRowStorage(BaseItemStorage[StoredLineageRow], ILineageRowStorag
         indexable. The set is returned unconditionally -- a conditionally omitted
         key would be missing from the schema derived from the sample item.
 
-        Note which columns are strings. ``get_by_where`` only builds an ``IN``
-        clause for string-typed columns and silently degrades to
-        ``column == [list]`` for anything else, so every column a batched query
-        filters on (``source``, ``target``, ``target_run_uuid``, ``build_id``,
-        ``job_id``, ``source_system``) must be text. ``derivable`` is a bool and is
-        only ever compared for equality, never batched.
+        **Every promoted column is a string, by construction.** ``get_by_where``
+        builds an ``IN`` clause only for string-typed columns and otherwise
+        degrades *silently* to ``column == [list]`` -- a meaningless predicate that
+        returns plausible but wrong rows with no error. Keeping the promoted set
+        all-text makes that failure unreachable rather than merely avoided by
+        convention.
         """
         fields_to_include = {
             "job_id",
             "source",
             "target",
-            "source_filter",
-            "target_filter",
-            "source_kind",
-            "source_namespace",
-            "source_name",
-            "source_table",
-            "source_revision",
-            "target_kind",
-            "target_namespace",
-            "target_name",
-            "target_table",
-            "target_revision",
-            "source_uri",
-            "target_uri",
-            "source_system",
-            "derivable",
-            "build_id",
-            "target_run_uuid",
         }
         return item.model_dump(include=fields_to_include)
 
@@ -117,31 +92,13 @@ class BaseLineageRowStorage(BaseItemStorage[StoredLineageRow], ILineageRowStorag
         """Return a sample row used to derive the table schema.
 
         Every column must be present and of its real type here: the SQL layer
-        infers each column's type from this item's values. The filters are
-        non-None so they are typed as text rather than being skipped.
+        infers each column's type from this item's values. So this is the schema,
+        not an example of one.
         """
         return StoredLineageRow(
             job_id="sample-job",
-            source="model:host/ns::sample|tbl",
-            target="dataset:host/ns::sample|tbl",
-            source_filter='{"dt":"2024-01-01"}',
-            target_filter='{"dt":"2024-01-01"}',
-            source_kind="model",
-            source_namespace="host/ns",
-            source_name="sample",
-            source_table="tbl",
-            source_revision="v1",
-            target_kind="dataset",
-            target_namespace="host/ns",
-            target_name="sample",
-            target_table="tbl",
-            target_revision="",
-            source_uri="lh://prod/ns/models/tbl/sample",
-            target_uri="lh://prod/ns/datasets/tbl/sample",
-            source_system="granite.build",
-            derivable=True,
-            build_id="sample-build",
-            target_run_uuid="sample-target-run",
+            source="lh://prod/ns/models/tbl/sample",
+            target="hf://huggingface.co/models/org/sample",
         )
 
     def get_rows_by_source(self, sources: List[str]) -> List[StoredLineageRow]:
@@ -150,7 +107,7 @@ class BaseLineageRowStorage(BaseItemStorage[StoredLineageRow], ILineageRowStorag
         One batched, indexed query -- the descendant hop of a level-order walk.
 
         Args:
-            sources: canonical identifiers of the current frontier. The terminal
+            sources: normalized URIs of the current frontier. The terminal
                 marker is dropped: a creation row's source identifies no artifact,
                 so matching on it would join unrelated creations together.
 
@@ -174,7 +131,7 @@ class BaseLineageRowStorage(BaseItemStorage[StoredLineageRow], ILineageRowStorag
 
     @staticmethod
     def _batchable(identifiers: List[str]) -> List[str]:
-        """Drop empty identifiers and duplicates from a hop's frontier.
+        """Drop empty URIs and duplicates from a hop's frontier.
 
         The terminal marker must never reach a query: every creation row shares it,
         so a hop matching on it would treat unrelated creations as one node. The
@@ -182,70 +139,45 @@ class BaseLineageRowStorage(BaseItemStorage[StoredLineageRow], ILineageRowStorag
         """
         return sorted({value for value in identifiers if value and value != TERMINAL})
 
-    def get_rows_by_build(self, build_id: str) -> List[StoredLineageRow]:
-        """Return every row recorded for one build.
-
-        Seeds a build-scoped graph with one indexed query, rather than loading the
-        build's target runs and deriving the rows again.
-        """
-        if not build_id:
-            return []
-        return self.get_by_where({"build_id": build_id})
-
     def get_rows_by_job(self, job_id: str) -> List[StoredLineageRow]:
         """Return every row of one job execution.
 
         This is what makes the N*M decomposition lossless: the rows sharing a
-        ``job_id`` still say which inputs and outputs that execution had.
+        ``job_id`` still say which inputs and outputs that execution had, which is
+        how the read path rebuilds a single run node from several rows.
         """
         if not job_id:
             return []
         return self.get_by_where({"job_id": job_id})
 
-    def has_rows_for_target_run(self, target_run_uuid: str) -> bool:
-        """Whether any row is already recorded for a target run."""
-        if not target_run_uuid:
+    def has_rows_for_job(self, job_id: str) -> bool:
+        """Whether any row is already recorded for a job."""
+        if not job_id:
             return False
-        return bool(self.get_by_where({"target_run_uuid": target_run_uuid}))
+        return bool(self.get_by_where({"job_id": job_id}))
 
-    def get_recorded_target_runs(self, target_run_uuids: List[str]) -> set:
-        """Return which of ``target_run_uuids`` already have rows.
+    def get_recorded_jobs(self, job_ids: List[str]) -> set:
+        """Return which of ``job_ids`` already have rows.
 
-        The sink's dedup is presence-based: a target run either has its rows or it
-        does not. It deliberately does not compare a row count against the
-        reconciler's ``expected_counts``, which counts one W&B run per output
-        artifact -- a shape that never matches an N*M row count, and would report
-        every target as unrecorded forever.
+        The sink's dedup is presence-based: a job's rows are written together, so a
+        job either has them or it does not. It deliberately does not compare a row
+        count against the reconciler's ``expected_counts``, which counts one W&B run
+        per output artifact -- a shape that never matches an N*M row count, and
+        would report every job as unrecorded forever.
+
+        Keyed on ``job_id`` rather than on any process id because ``job_id`` is the
+        only identifier every lineage source has by definition. A build or a target
+        run is granite.build's own concept and is absent from every imported row, so
+        deduping on one would leave imported sources with no dedup at all.
 
         Args:
-            target_run_uuids: the target runs to check.
+            job_ids: the job executions to check.
 
         Returns:
             The subset that already has at least one row.
         """
-        wanted = self._batchable(list(target_run_uuids))
+        wanted = self._batchable(list(job_ids))
         if not wanted:
             return set()
-        rows = self.get_by_where({"target_run_uuid": wanted})
-        return {row.target_run_uuid for row in rows if row.target_run_uuid}
-
-    def delete_derivable_rows(self, source_system: str) -> int:
-        """Delete the re-derivable rows of one source system.
-
-        Imported rows are left untouched: they carry ``derivable=False`` and could
-        not be regenerated, since the sources they came from are being switched
-        off. Because the graph has no node table, deleting rows cannot orphan
-        anything.
-
-        Args:
-            source_system: the system whose derivable rows to drop.
-
-        Returns:
-            How many rows were deleted.
-        """
-        rows = self.get_by_where({"source_system": source_system, "derivable": True})
-        deleted = 0
-        for row in rows:
-            self.delete(row.uuid)
-            deleted += 1
-        return deleted
+        rows = self.get_by_where({"job_id": wanted})
+        return {row.job_id for row in rows if row.job_id}

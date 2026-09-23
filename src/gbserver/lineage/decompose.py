@@ -31,12 +31,17 @@ type -- because the same function serves the build sink and the future importers
 of Lakehouse/dmf-ng/W&B lineage. Nothing here imports storage or granite.build
 models.
 
+An endpoint is the artifact's **normalized URI**, so a producer only has to record
+a URI to be understood; there is no per-source identity translation to supply.
+
 Ported from ``prototype-lineage-py`` (``lineage/decompose.py``, in turn
 ``NewStatsInput.getLineageRecords``), including its N*M guard -- see
 :func:`to_lineage_rows`.
 """
 
-from typing import Any, Optional
+from typing import Optional
+
+from gbserver.lineage.uri_normalize import normalize_uri
 
 # Job metadata copied verbatim onto every row emitted from one job. The traversal
 # never reads these; they travel so a row can be explained without a second
@@ -45,6 +50,12 @@ JOB_METADATA_KEYS = (
     "release_id",
     "category",
     "job_name",
+    # The space/build the execution belongs to, as "<space_name>/<build_name>".
+    # Load-bearing for authorization, not display: the read path splits it on the
+    # first "/" to recover the space and prunes nodes the caller cannot see. A row
+    # that loses it fails closed, so every node built from it disappears from every
+    # graph -- which is why it must survive decomposition.
+    "job_namespace",
     "job_id",
     "job_type",
     "owner",
@@ -55,6 +66,13 @@ JOB_METADATA_KEYS = (
     "execution_stats",
     "job_output_stats",
     "source_code_details",
+    # The originating endpoint records, when a source carries them. Lakehouse's
+    # dmf.lineage keeps each endpoint as a struct whose snapshot_id, path and
+    # extra fields have no column in gb_lineage; carrying them here is the only
+    # way they survive, and they are not recoverable once Lakehouse is off.
+    # Absent from every other source, so nothing else is affected.
+    "source_object",
+    "target_object",
 )
 
 
@@ -68,23 +86,23 @@ class LineageRowDraft:
     A plain container rather than the storage model, so decomposition stays
     independent of the storage layer and testable without a database.
 
-    ``source`` and ``target`` are ``None`` for the terminal cases -- a creation
-    job has no input, a deletion job has no output. That ``None`` is real
-    information, not a missing value, and the traversal stops there rather than
-    chaining through it.
+    ``source`` and ``target`` are the artifacts' **normalized URIs**, and ``""``
+    for the terminal cases -- a creation job has no input, a deletion job no
+    output. That empty string is real information, not a missing value, and the
+    traversal stops there rather than chaining through it. It is also what
+    ``normalize_uri`` returns for a URI it cannot identify, which collapses to the
+    same thing: an endpoint with no usable identity ends a path.
+
+    There is no separate ``source_uri``/``target_uri`` here any more. The old
+    identifier scheme did not encode a URI's scheme, so the real URI had to travel
+    alongside it; with the URI *as* the identity the pair would be the same string
+    twice.
 
     Attributes:
         job_id: identity of the job execution; the same value on every row of one
             job, and what makes the decomposition regroupable.
-        source: canonical identifier of the input artifact, or ``None`` (creation).
-        target: canonical identifier of the output artifact, or ``None`` (deletion).
-        source_uri: the input artifact's real URI, verbatim from the artifact dict,
-            or ``""`` when it has none. Carried because a canonical identifier does
-            not encode the scheme: ``hf://`` and ``s3://`` are unrecoverable from
-            it, so the URI has to travel rather than be re-derived downstream.
-        target_uri: the output artifact's real URI; see ``source_uri``.
-        source_filter: partition filter scoping the input, or ``None``.
-        target_filter: partition filter scoping the output, or ``None``.
+        source: normalized URI of the input artifact, or ``""`` (creation).
+        target: normalized URI of the output artifact, or ``""`` (deletion).
         source_artifact: the input artifact dict this row came from, if any.
         target_artifact: the output artifact dict this row came from, if any.
         metadata: the job metadata carried onto this row.
@@ -94,10 +112,6 @@ class LineageRowDraft:
         "job_id",
         "source",
         "target",
-        "source_uri",
-        "target_uri",
-        "source_filter",
-        "target_filter",
         "source_artifact",
         "target_artifact",
         "metadata",
@@ -106,12 +120,8 @@ class LineageRowDraft:
     def __init__(
         self,
         job_id: str,
-        source: Optional[str] = None,
-        target: Optional[str] = None,
-        source_uri: str = "",
-        target_uri: str = "",
-        source_filter: Optional[str] = None,
-        target_filter: Optional[str] = None,
+        source: str = "",
+        target: str = "",
         source_artifact: Optional[dict] = None,
         target_artifact: Optional[dict] = None,
         metadata: Optional[dict] = None,
@@ -119,10 +129,6 @@ class LineageRowDraft:
         self.job_id = job_id
         self.source = source
         self.target = target
-        self.source_uri = source_uri
-        self.target_uri = target_uri
-        self.source_filter = source_filter
-        self.target_filter = target_filter
         self.source_artifact = source_artifact
         self.target_artifact = target_artifact
         self.metadata = metadata if metadata is not None else {}
@@ -180,27 +186,46 @@ def _artifact_uri(artifact: Optional[dict]) -> str:
     return ""
 
 
+def _normalized_job_keys() -> tuple:
+    """The job-dict keys holding artifact lists, in endpoint order.
+
+    Exposed so a caller reading endpoints out of a job entry (the build-graph
+    seeding) uses the same keys decomposition does, rather than restating them.
+    """
+    return ("sources", "targets")
+
+
+def _endpoint(artifact: Optional[dict]) -> str:
+    """Return an artifact dict's normalized URI, or ``""`` when it has none.
+
+    The two ways of getting ``""`` are deliberately indistinguishable here: no
+    artifact at all (a terminal -- this job had no input, or produced no output),
+    and an artifact whose URI carries no identity this index can key on. Both mean
+    the path ends, and both are the row's terminal marker.
+
+    The second case is worth counting rather than only ending a path, which is why
+    ``normalize_uri`` logs it: a rising count means some producer is emitting a URI
+    shape with no identity rule, and every such endpoint is a hole in the graph.
+    """
+    if not artifact:
+        return ""
+    return normalize_uri(_artifact_uri(artifact))
+
+
 def _job_metadata(job: dict) -> dict:
     """Collect the metadata keys present on ``job``."""
     return {key: job[key] for key in JOB_METADATA_KEYS if key in job}
 
 
-def to_lineage_rows(
-    job: dict,
-    identify: Any,
-) -> list[LineageRowDraft]:
+def to_lineage_rows(job: dict) -> list[LineageRowDraft]:
     """Decompose a job entry into flat lineage rows.
 
     Args:
         job: the job entry. Recognized keys: ``job_id`` (required), ``sources``
             and ``targets`` (lists of artifact dicts, either may be empty), plus
-            the optional metadata in :data:`JOB_METADATA_KEYS`. Each artifact dict
-            is passed to ``identify`` untouched, so its shape is that function's
-            concern, except for an optional ``filter`` read here.
-        identify: callable mapping one artifact dict to its canonical identifier
-            string. Injected rather than imported so decomposition stays testable
-            without the identity scheme, and so an importer can supply its own
-            translation.
+            the optional metadata in :data:`JOB_METADATA_KEYS`. An artifact dict is
+            read only for its URI (see :func:`_artifact_uri`), so any producer that
+            records one is supported without a per-source translation.
 
     Returns:
         The rows, in a deterministic order: by source then target as given. By the
@@ -259,26 +284,8 @@ def to_lineage_rows(
     ) -> LineageRowDraft:
         return LineageRowDraft(
             job_id=job_id,
-            source=identify(source) if source is not None else None,
-            target=identify(target) if target is not None else None,
-            source_uri=_artifact_uri(source),
-            target_uri=_artifact_uri(target),
-            # Read verbatim, NOT normalized. The prototype's normalize_filter
-            # (ALGORITHM.md 3.3) collapses a [{"name","value"}] array into a map,
-            # maps an empty array / malformed JSON to None, and falls back to a
-            # "partition_filter" key. None of that is ported, because partition
-            # filters do not exist in this domain: ArtifactRegistration has no
-            # filter or partition field, so no producer can emit one and these are
-            # always None today. The traversal likewise implements no filter
-            # propagation (ALGORITHM.md 4.3) -- walk.py never reads these columns.
-            #
-            # If partitioned artifacts ever arrive, port normalization and
-            # propagation TOGETHER, and backfill: rows written before
-            # normalization hold raw strings, so an array-shaped filter and an
-            # equivalent object-shaped one are different values and would never
-            # match once propagation starts comparing them.
-            source_filter=source.get("filter") if source else None,
-            target_filter=target.get("filter") if target else None,
+            source=_endpoint(source),
+            target=_endpoint(target),
             source_artifact=source,
             target_artifact=target,
             metadata=dict(metadata),
@@ -312,15 +319,19 @@ def group_by_job(rows: list[LineageRowDraft]) -> dict[str, dict[str, set]]:
         rows: decomposed rows, from any number of jobs.
 
     Returns:
-        ``{job_id: {"sources": {...}, "targets": {...}}}`` with ``None``
-        identifiers excluded, so a creation job reports no sources and a deletion
-        job no targets.
+        ``{job_id: {"sources": {...}, "targets": {...}}}`` with terminal endpoints
+        excluded, so a creation job reports no sources and a deletion job no
+        targets.
+
+        The exclusion is by truthiness, not ``is not None``: a terminal is the empty
+        string, so a ``None`` check would report ``{""}`` as an input -- a phantom
+        artifact that every creation job in the set would appear to share.
     """
     grouped: dict[str, dict[str, set]] = {}
     for row in rows:
         entry = grouped.setdefault(row.job_id, {"sources": set(), "targets": set()})
-        if row.source is not None:
+        if row.source:
             entry["sources"].add(row.source)
-        if row.target is not None:
+        if row.target:
             entry["targets"].add(row.target)
     return grouped

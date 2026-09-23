@@ -23,6 +23,7 @@ structure -- especially that terminals do not become nodes and that one job's ro
 converge on one run node.
 """
 
+from gbserver.lineage.attributes import build_attributes
 from gbserver.lineage.graph_builder import build_graph_dict
 from gbserver.lineage.walk import LineageGraph
 from gbserver.storage.stored_lineage_row import TERMINAL, StoredLineageRow
@@ -32,18 +33,46 @@ def row(
     job_id: str,
     source: str,
     target: str,
-    source_uri: str = "",
-    target_uri: str = "",
     **kwargs,
 ) -> StoredLineageRow:
+    """A row whose endpoints are URIs.
+
+    Per-endpoint detail (``source_kind``, ``target_name``, ...) and job metadata go
+    into ``attributes``, the JSON blob, since neither is a column. Accepted as
+    keywords here and folded in, so the tests stay readable.
+    """
+    if "attributes" in kwargs:
+        attributes = dict(kwargs.pop("attributes") or {})
+    else:
+        attributes = build_attributes(
+            job_metadata=kwargs.pop("metadata", None),
+            source_artifact=_artifact_of(kwargs, "source"),
+            target_artifact=_artifact_of(kwargs, "target"),
+            source_system=kwargs.pop("source_system", "granite.build"),
+            ids={
+                "build_id": kwargs.pop("build_id", ""),
+                "target_run_uuid": kwargs.pop("target_run_uuid", ""),
+            },
+        )
+    assert not kwargs, f"unhandled row() keywords: {sorted(kwargs)}"
     return StoredLineageRow(
         job_id=job_id,
         source=source,
         target=target,
-        source_uri=source_uri,
-        target_uri=target_uri,
-        **kwargs,
+        attributes=attributes,
     )
+
+
+def _artifact_of(kwargs: dict, side: str) -> dict:
+    """Build the artifact dict for one side from ``<side>_kind``/``<side>_name``."""
+    artifact = {}
+    kind = kwargs.pop(f"{side}_kind", "")
+    name = kwargs.pop(f"{side}_name", "")
+    if kind:
+        artifact["artifact_type"] = kind
+    if name:
+        artifact["name"] = name
+    return artifact
 
 
 def graph_of(*rows) -> LineageGraph:
@@ -63,9 +92,11 @@ def edge_pairs(result: dict) -> set:
     return {(e["source"], e["target"]) for e in result["edges"]}
 
 
-A = "table:prod/ns::a"
-B = "table:prod/ns::b"
-C = "table:prod/ns::c"
+# Endpoints are normalized URIs -- the node's identity and what the frontend
+# deduplicates by are now the same string.
+A = "lh://prod/ns/tables/a"
+B = "lh://prod/ns/tables/b"
+C = "lh://prod/ns/tables/c"
 
 
 class TestBipartiteShape:
@@ -170,10 +201,16 @@ class TestNodeIdentity:
         ids = [n["id"] for n in nodes_by_type(result, "artifact")]
         assert len(ids) == len(set(ids))
 
-    def test_stored_uri_reaches_the_node_metadata(self):
-        result = build_graph_dict(graph_of(row("J1", A, B, source_uri="s3://bkt/a")), A)
+    def test_the_node_id_and_its_uri_are_the_same_string(self):
+        """There is no separate stored URI to keep in step any more.
+
+        The old row carried ``source_uri``/``target_uri`` because a canonical
+        identifier did not encode a scheme, so the real URI had to travel beside it.
+        With the URI as the identity, the node id *is* the URI.
+        """
+        result = build_graph_dict(graph_of(row("J1", A, B)), root_uri=A)
         node = next(n for n in result["nodes"] if n["id"] == A)
-        assert node["metadata"]["uri"] == "s3://bkt/a"
+        assert node["metadata"]["uri"] == A == node["id"]
 
     def test_nodes_without_a_stored_uri_still_differ(self):
         # What the frontend deduplicates by, so equal URIs would merge them.
@@ -182,17 +219,32 @@ class TestNodeIdentity:
         assert len(uris) == len(set(uris))
         assert all(u for u in uris)
 
-    def test_name_falls_back_to_the_identifier_pieces(self):
-        # An importer may not promote every column; the identifier always has them.
-        result = build_graph_dict(graph_of(row("J1", A, B)), A)
+    def test_name_falls_back_to_the_last_uri_segment(self):
+        """A producer that recorded no name still yields a readable node.
+
+        The last path segment is the artifact's own name in every scheme stored here
+        (a model label, a table name, an object key), so it beats showing the whole
+        URI -- and showing nothing at all is worse than either.
+        """
+        result = build_graph_dict(graph_of(row("J1", A, B)), root_uri=A)
         node = next(n for n in result["nodes"] if n["id"] == A)
         assert node["name"] == "a"
-        assert node["artifact_type"] == "table"
 
-    def test_promoted_columns_are_preferred_over_parsing(self):
+    def test_artifact_type_is_absent_when_no_row_recorded_one(self):
+        """It is not guessed from the URI shape.
+
+        The blob is the only source for a node's type. Inferring ``table`` from an
+        ``lh://.../tables/...`` path would be a second, silently diverging opinion
+        about what an artifact is.
+        """
+        result = build_graph_dict(graph_of(row("J1", A, B)), root_uri=A)
+        node = next(n for n in result["nodes"] if n["id"] == A)
+        assert node["artifact_type"] is None
+
+    def test_recorded_detail_is_preferred_over_the_uri_fallback(self):
         result = build_graph_dict(
             graph_of(row("J1", A, B, source_name="Display Name", source_kind="model")),
-            A,
+            root_uri=A,
         )
         node = next(n for n in result["nodes"] if n["id"] == A)
         assert node["name"] == "Display Name"
@@ -251,3 +303,82 @@ class TestTruncation:
 
     def test_untruncated_is_propagated(self):
         assert build_graph_dict(graph_of(row("J1", A, B)), A)["truncated"] is False
+
+
+class TestSelfLoopCollapse:
+    """In-place rewrites collapse to one node, not one per row.
+
+    Real data made this necessary rather than nice: 30.4% of an imported Lakehouse
+    graph is self-loops, and one dataset was appended 68,905 times. A run node per row
+    produced a 55 MB response describing a single artifact (2.3 KB after this).
+
+    It is safe to collapse *here*, rather than cap, because the traversal already
+    refuses to chain through a self-loop -- those rows expand no frontier and reach no
+    artifact the graph would otherwise miss. They are pure volume.
+    """
+
+    def test_many_rewrites_become_one_node(self):
+        rows = [row(f"J{i}", A, A) for i in range(500)]
+        result = build_graph_dict(graph_of(*rows), root_uri=A)
+        runs = nodes_by_type(result, "run")
+        assert len(runs) == 1
+        assert runs[0]["metadata"]["run_count"] == 500
+
+    def test_the_collapsed_node_is_flagged(self):
+        """A client must be able to tell a collapsed node from a real run."""
+        result = build_graph_dict(graph_of(row("J1", A, A)), root_uri=A)
+        run = nodes_by_type(result, "run")[0]
+        assert run["metadata"]["collapsed"] is True
+        assert run["id"].startswith("runs:")
+
+    def test_it_names_a_representative_job(self):
+        """The count needs somewhere to lead; this is the caller's starting point."""
+        result = build_graph_dict(graph_of(row("J7", A, A)), root_uri=A)
+        run = nodes_by_type(result, "run")[0]
+        assert run["metadata"]["representative_job_id"] == "J7"
+
+    def test_the_collapsed_id_cannot_collide_with_a_real_run(self):
+        result = build_graph_dict(
+            graph_of(row("J1", A, A), row("J2", A, B)), root_uri=A
+        )
+        ids = {n["id"] for n in nodes_by_type(result, "run")}
+        assert ids == {f"runs:{A}", "run:J2"}
+
+    def test_the_rewritten_artifact_still_appears(self):
+        result = build_graph_dict(graph_of(row("J1", A, A)), root_uri=A)
+        assert A in {n["id"] for n in nodes_by_type(result, "artifact")}
+
+    def test_the_rewrite_reads_as_a_cycle_on_the_artifact(self):
+        """Both edges, so it is not a dangling node; deduped however many rows."""
+        rows = [row(f"J{i}", A, A) for i in range(100)]
+        result = build_graph_dict(graph_of(*rows), root_uri=A)
+        assert len(result["edges"]) == 2
+        assert {(e["source"], e["target"]) for e in result["edges"]} == {
+            (A, f"runs:{A}"),
+            (f"runs:{A}", A),
+        }
+
+    def test_two_rewritten_artifacts_get_a_node_each(self):
+        result = build_graph_dict(
+            graph_of(row("J1", A, A), row("J2", B, B)), root_uri=A
+        )
+        assert len(nodes_by_type(result, "run")) == 2
+
+    def test_real_runs_are_untouched(self):
+        """A graph with no self-loops must render exactly as before."""
+        rows = [row("J1", A, B), row("J2", B, C)]
+        result = build_graph_dict(graph_of(*rows), root_uri=A)
+        runs = nodes_by_type(result, "run")
+        assert {r["id"] for r in runs} == {"run:J1", "run:J2"}
+        assert all("collapsed" not in r["metadata"] for r in runs)
+
+    def test_the_namespace_survives_for_authorization(self):
+        """POST /artifact filters runs per space, so a collapsed node needs it.
+
+        Without it the collapsed node fails closed and vanishes from that route.
+        """
+        result = build_graph_dict(
+            graph_of(row("J1", A, A, metadata={"job_namespace": "sp/build"})),
+            root_uri=A,
+        )
+        assert nodes_by_type(result, "run")[0]["metadata"]["job_namespace"] == "sp/build"

@@ -60,9 +60,9 @@ class FakeStorage:
         return [r for r in self.rows if r.target in wanted]
 
 
-def row(job_id: str, source: str, target: str, build_id: str = "B") -> StoredLineageRow:
+def row(job_id: str, source: str, target: str) -> StoredLineageRow:
     return StoredLineageRow(
-        job_id=job_id, source=source, target=target, build_id=build_id
+        job_id=job_id, source=source, target=target
     )
 
 
@@ -239,18 +239,25 @@ class TestQueryCost:
         assert storage.queries >= 2
 
 
-class TestBuildScope:
-    def test_walk_can_stay_inside_one_build(self):
-        rows = [row("J1", "a", "b", build_id="B1"), row("J2", "b", "c", build_id="B2")]
-        storage = FakeStorage(rows)
-        graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS, build_id="B1")
-        assert graph.depths == {"a": 0, "b": 1}
+class TestScopingIsBySeedNotByFilter:
+    """A scoped walk is expressed by choosing seeds, not by filtering rows.
 
-    def test_without_scope_the_walk_crosses_builds(self):
-        rows = [row("J1", "a", "b", build_id="B1"), row("J2", "b", "c", build_id="B2")]
+    ``walk_lineage`` used to take a ``build_id`` that it applied in Python *after*
+    each level's query. The column is gone (a build is granite.build's own concept,
+    empty on every imported row), and with it the filter: a caller wanting a scoped
+    view resolves that scope in its own system and passes the URIs it produced.
+    """
+
+    def test_walk_lineage_takes_no_build_scope(self):
+        import inspect
+
+        assert "build_id" not in inspect.signature(walk_lineage).parameters
+
+    def test_seeding_a_subset_bounds_the_graph(self, ):
+        rows = [row("J1", "a", "b"), row("J2", "c", "d")]
         storage = FakeStorage(rows)
         graph = walk_lineage(storage, ["a"], Direction.DESCENDANTS)
-        assert graph.depths == {"a": 0, "b": 1, "c": 2}
+        assert graph.depths == {"a": 0, "b": 1}
 
 
 class TestEmptyCases:
@@ -308,7 +315,7 @@ def random_graph(seed: int, nodes: int = 12, edges: int = 20) -> list:
             source, target = node, node  # self-loop
         else:
             source, target = rng.choice(names), rng.choice(names)
-        rows.append(row(f"J{i}", source, target, build_id=rng.choice(["B1", "B2"])))
+        rows.append(row(f"J{i}", source, target))
     return rows
 
 
@@ -350,19 +357,6 @@ class TestCrossCheckAgainstReference:
         graph = walk_lineage(storage, ["n0"], Direction.BOTH, max_depth=max_depth)
         ref_keys, ref_depths, _ = reference_walk(
             rows, ["n0"], Direction.BOTH, max_depth=max_depth
-        )
-        assert keys(graph) == ref_keys
-        assert graph.depths == ref_depths
-
-    @pytest.mark.parametrize("seed", [0, 1, 2, 24])
-    def test_matches_reference_when_scoped_to_a_build(self, seed):
-        rows = random_graph(seed)
-        storage = FakeStorage(rows)
-        graph = walk_lineage(
-            storage, ["n0"], Direction.BOTH, max_depth=DEFAULT_MAX_DEPTH, build_id="B1"
-        )
-        ref_keys, ref_depths, _ = reference_walk(
-            rows, ["n0"], Direction.BOTH, max_depth=DEFAULT_MAX_DEPTH, build_id="B1"
         )
         assert keys(graph) == ref_keys
         assert graph.depths == ref_depths

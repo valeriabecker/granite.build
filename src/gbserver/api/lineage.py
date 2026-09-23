@@ -17,26 +17,34 @@
 from __future__ import annotations
 
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from gbserver.api.build_files_paths import authorize_build_read_access
 from gbserver.api.utils import has_space_member_access
+from gbserver.lineage.uri_normalize import display_uri_from_url
 from gbserver.lineage.openlineage_models import (
+    LineageGraphResponse,
+    LineageRunsResponse,
+    LineageQueryRequest,
     ArtifactGraphRequest,
     ArtifactGraphResponse,
     ArtifactRunEntry,
+    BuildGraphRequest,
+    BuildGraphResponse,
 )
 from gbserver.lineage.openlineage_models import LineageEvent as OpenLineageEvent
+from gbserver.lineage.uri_normalize import display_uri_from_url
 from gbserver.lineage.openlineage_models import (
+    LineageGraphResponse,
+    LineageRunsResponse,
+    LineageQueryRequest,
     LineageNodeRef,
     PaginatedResponse,
     TagSearchRequest,
 )
 from gbserver.lineage.openlineage_service import LineageService, LineageServiceFactory
-from gbserver.lineage.openlineage_utils import parse_hf_url
 from gbserver.storage.singleton_storage import get_admin_storage
 from gbserver.storage.stored_build import StoredBuild
 from gbserver.storage.stored_target_run import StoredTargetRun
@@ -51,20 +59,6 @@ logger = get_logger(__name__)
 # accessible fraction is a tiny sliver of a huge global result set.
 _SEARCH_SCAN_BACKEND_PAGE_SIZE = 100
 _SEARCH_SCAN_MAX_BACKEND_ITEMS = 2000
-
-
-def _uri_from_url(url: Optional[str]) -> Optional[str]:
-    """Derive an hf:// URI from a huggingface.co URL."""
-    if not url:
-        return None
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or "huggingface.co"
-        org, name, artifact_type = parse_hf_url(url)
-        type_part = f"{artifact_type}s/" if artifact_type != "model" else ""
-        return f"hf://{host}/{type_part}{org}/{name}"
-    except Exception:
-        return url
 
 
 def get_redacted_job_input_params(source: dict) -> dict:
@@ -362,7 +356,7 @@ def get_artifact_graph(request: Request, body: ArtifactGraphRequest):
                 node_type = source_node.get("node_type", "")
                 if node_type == "artifact":
                     source_meta = source_node.get("metadata") or {}
-                    uri = source_meta.get("uri") or _uri_from_url(
+                    uri = source_meta.get("uri") or display_uri_from_url(
                         source_meta.get("url")
                     )
                     inputs.append(
@@ -388,7 +382,7 @@ def get_artifact_graph(request: Request, body: ArtifactGraphRequest):
                 node_type = target_node.get("node_type", "")
                 if node_type == "artifact":
                     target_meta = target_node.get("metadata") or {}
-                    uri = target_meta.get("uri") or _uri_from_url(
+                    uri = target_meta.get("uri") or display_uri_from_url(
                         target_meta.get("url")
                     )
                     outputs.append(
@@ -449,4 +443,259 @@ def get_artifact_graph(request: Request, body: ArtifactGraphRequest):
         root_id=result["root_id"],
         runs=runs,
         truncated=result["truncated"],
+    )
+
+
+@lineage_api.post("/build")
+def get_build_graph(request: Request, body: BuildGraphRequest) -> BuildGraphResponse:
+    """Return the lineage graph seeded from every artifact a build touched.
+
+    A build is not a graph node, and it is not a column in the lineage index
+    either: a build is a granite.build process concept, absent from every imported
+    row. It is resolved outside the index -- the build's target runs name their
+    artifacts, those artifacts' URIs become the seed set, and the walk is the
+    ordinary one from there.
+
+    Authorization is on the seed build, the same check ``get_build_jobstats``
+    applies.
+
+    Authorization is on the **seed build only**, the same check
+    ``get_build_jobstats`` applies. The walk then follows edges out of this build into
+    artifacts produced by others, and those are deliberately not re-authorized: see
+    :func:`query_lineage_graph` for why a lineage graph is cross-space by design and
+    what that costs. ``within_build_only`` used to bound the walk instead; it filtered
+    on a ``build_id`` column the index no longer has, and a scoped walk is now
+    expressed by choosing seeds.
+
+    Only the database-backed lineage service can answer this: a build is a
+    granite.build concept that the external backends have no notion of, so the
+    method is not on the ``LineageService`` interface and this endpoint reports
+    501 rather than inventing an empty answer.
+    """
+    if body.direction not in ("downstream", "upstream", "both"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="direction must be 'downstream', 'upstream', or 'both'",
+        )
+
+    storage = get_admin_storage()
+    build = storage.build_storage.get_by_uuid(body.build_id)
+    if build is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Build with id {body.build_id} not found",
+        )
+    assert isinstance(build, StoredBuild)
+    authorize_build_read_access(request, build)
+
+    # Deferred: importing the DB service at module scope would pull the storage
+    # layer into every environment that serves lineage from an external backend.
+    # pylint: disable=import-outside-toplevel
+    from gbserver.lineage.db_service import DBLineageService
+
+    service = _get_openlineage_service()
+    if not isinstance(service, DBLineageService):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Build-seeded lineage requires the database lineage provider; "
+                f"the configured provider is {type(service).__name__}."
+            ),
+        )
+
+    try:
+        result = service.get_build_graph(
+            build_id=body.build_id,
+            direction=body.direction,
+            max_depth=body.max_depth,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
+    # A build with no lineage rows is not an error: it ran nothing that produced
+    # or consumed an artifact. An empty graph says so, and reads the same as the
+    # artifact path's "nothing recorded is a real answer".
+    if result is None:
+        return BuildGraphResponse(root_id=body.build_id)
+
+    return BuildGraphResponse(
+        root_id=result.get("root_id", body.build_id),
+        nodes=result.get("nodes", []),
+        edges=result.get("edges", []),
+        truncated=result.get("truncated", False),
+    )
+
+# The only routes in this file taking query params. A GET with filters is what a UI
+# wants for a shareable, bookmarkable lineage view, and every filter here maps to an
+# indexed text column, so there is no shape a caller can ask for that forces a scan.
+@lineage_api.get("/graph")
+def query_lineage_graph_get(
+    request: Request,
+    uri: Optional[str] = None,
+    job_id: Optional[str] = None,
+    direction: str = "both",
+    depth: int = 10,
+) -> LineageGraphResponse:
+    """Query the lineage graph by URI, by job, or with no filter at all.
+
+    The GET form of :func:`query_lineage_graph`; see it for the semantics.
+    """
+    return query_lineage_graph(
+        request,
+        LineageQueryRequest(
+            uri=uri, job_id=job_id, direction=direction, max_depth=depth
+        ),
+    )
+
+
+@lineage_api.post("/graph")
+def query_lineage_graph(
+    request: Request, body: LineageQueryRequest
+) -> LineageGraphResponse:
+    """Query the lineage graph with any combination of optional filters.
+
+    One entry point so a caller asks however it holds the artifact rather than the
+    index dictating a lookup shape:
+
+    - ``uri`` -- that artifact's lineage, up and down. Any spelling: a browser URL
+      and the runtime's own URI normalize to one artifact.
+    - ``job_id`` -- seeded from every endpoint of that execution.
+    - both -- the union of their seeds.
+    - neither -- the most recent lineage activity, capped.
+
+    Unlike ``POST /artifact`` this returns the node/edge graph directly, with a
+    ``depth`` per node, instead of re-projecting it into run-centred entries. It also
+    never 404s: an empty graph means "nothing recorded", which is a real answer, and a
+    caller must not render it as an error.
+
+    There is no ``build_id`` filter. The index has no such column -- a build is a
+    granite.build process concept, absent from every imported row -- and a
+    build-scoped view goes through ``POST /build``, which resolves the build outside
+    the index and seeds this same walk.
+
+    Only the database-backed provider can answer this: the external backends have no
+    such query, so this reports 501 rather than inventing an empty answer.
+
+    **The graph is cross-space and is NOT filtered per space.** That is deliberate,
+    and it is the one design decision here worth stating twice.
+
+    A lineage graph carries no access to anything: it holds artifact URIs, job names
+    and edges. Reading a model, pulling a dataset or fetching a step config each needs
+    its own authorized call, none of which route through here.
+
+    Filtering it would break the question lineage exists to answer. A chain almost
+    always crosses spaces -- a shared curated dataset, a platform-team base model --
+    so pruning nodes from spaces the caller cannot read makes "what was my model
+    trained on?" silently unanswerable: the graph would look complete while stopping
+    at the space boundary. A truthful partial answer is not available here, only a
+    misleading one.
+
+    The accepted cost: artifact URIs and job names are visible across spaces. That is
+    broader than ``GET /artifacts/``, which narrows to the caller's spaces via
+    ``scope_space_name_filter``. Provenance is judged worth that asymmetry -- so if
+    an artifact URI or a job name is ever itself a secret, this route is the wrong
+    place to keep it.
+    """
+    if body.direction not in ("downstream", "upstream", "both"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="direction must be 'downstream', 'upstream', or 'both'",
+        )
+
+    # Deferred: importing the DB service at module scope would pull the storage layer
+    # into every environment that serves lineage from an external backend.
+    # pylint: disable=import-outside-toplevel
+    from gbserver.lineage.db_service import DBLineageService
+
+    service = _get_openlineage_service()
+    if not isinstance(service, DBLineageService):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Lineage graph queries require the database lineage provider; "
+                f"the configured provider is {type(service).__name__}."
+            ),
+        )
+
+    try:
+        result = service.query_graph(
+            uri=body.uri,
+            job_id=body.job_id,
+            direction=body.direction,
+            max_depth=body.max_depth,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+    return LineageGraphResponse(
+        root_id=result.get("root_id", ""),
+        nodes=result.get("nodes", []),
+        edges=result.get("edges", []),
+        truncated=result.get("truncated", False),
+    )
+
+
+@lineage_api.get("/runs")
+def list_lineage_runs(
+    request: Request,
+    uri: Optional[str] = None,
+    job_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> LineageRunsResponse:
+    """List the job executions touching one artifact, paged.
+
+    The drill-down for what the graph deliberately does not carry. A graph response
+    collapses an artifact's in-place rewrites into a single node with a ``run_count``:
+    real data has a dataset appended 68,905 times, and one run node per append produced
+    a 55 MB response describing one artifact. That count needs somewhere to lead, and
+    this is it.
+
+    ``uri`` matches a run that consumed the artifact **or** produced it, since "the runs
+    touching this" means both; ``job_id`` lists one execution's rows instead. Both are
+    single indexed lookups.
+
+    Paged rather than capped, unlike the graph: a flat list has no shape to preserve, so
+    a caller can walk the whole thing. ``total`` is the unpaged count.
+
+    Only the database-backed provider can answer this: the external backends have no
+    such query, so this reports 501 rather than inventing an empty answer.
+
+    Cross-space by the same decision as the graph routes -- see
+    :func:`query_lineage_graph` for why a lineage answer is not filtered per space, and
+    what that costs.
+    """
+    if not uri and not job_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either uri or job_id must be provided",
+        )
+
+    # Deferred: importing the DB service at module scope would pull the storage layer
+    # into every environment that serves lineage from an external backend.
+    # pylint: disable=import-outside-toplevel
+    from gbserver.lineage.db_service import DBLineageService
+
+    service = _get_openlineage_service()
+    if not isinstance(service, DBLineageService):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Listing lineage runs requires the database lineage provider; "
+                f"the configured provider is {type(service).__name__}."
+            ),
+        )
+
+    result = service.list_runs(uri=uri, job_id=job_id, limit=limit, offset=offset)
+    return LineageRunsResponse(
+        runs=result.get("runs", []),
+        total=result.get("total", 0),
+        limit=result.get("limit", limit),
+        offset=result.get("offset", offset),
     )

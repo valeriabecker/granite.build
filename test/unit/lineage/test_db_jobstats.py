@@ -27,6 +27,14 @@ import uuid as uuid_module
 
 import pytest
 
+from gbserver.lineage.attributes import (
+    SOURCE,
+    endpoint_kind,
+    endpoint_name,
+    job_detail,
+    origin_id,
+    origin_system,
+)
 from gbserver.lineage.db_jobstats import DBLineageStore, _row_from_draft
 from gbserver.lineage.decompose import LineageRowDraft
 from gbserver.storage.sqlite.storage_factory import SqliteStorageFactory
@@ -110,7 +118,7 @@ class TestDecomposition:
             build_id="BLD",
             target_run_uuid="TR",
         )
-        assert rows.get_rows_by_build("BLD") == []
+        assert [r for pg in rows.get_paged() for r in pg] == []
 
     def test_a_malformed_job_is_skipped_not_raised(self, sink, rows):
         """A job the guard cannot rescue is logged and skipped, not fatal.
@@ -118,7 +126,7 @@ class TestDecomposition:
         One unrecordable entry must not abort the rest of a build's scan.
         """
         sink._write_job(job("J1", [], []), build_id="BLD", target_run_uuid="TR")
-        assert rows.get_rows_by_build("BLD") == []
+        assert [r for pg in rows.get_paged() for r in pg] == []
 
     def test_every_row_of_a_job_shares_its_job_id(self, sink, rows):
         sink._write_job(
@@ -159,7 +167,7 @@ class TestDecomposition:
             build_id="BLD",
             target_run_uuid="TR",
         )
-        assert rows.get_rows_by_build("BLD") == []
+        assert [r for pg in rows.get_paged() for r in pg] == []
 
 
 class TestIdempotence:
@@ -189,12 +197,21 @@ class TestIdempotence:
 
 
 class TestDedupByPresence:
+    """Dedup keys on ``job_id``, which for build lineage IS the target run uuid.
+
+    ``_build_events_for_target`` stamps ``job_details.job_id = targetrun.uuid``
+    (``wandb_jobstats.py:274``), so a target run and its job share one identifier.
+    That is what lets the index drop its ``target_run_uuid`` column without
+    weakening dedup -- and why these fixtures write a job whose id is the target
+    run's rather than an unrelated one.
+    """
+
     def test_filter_unrecorded_reports_targets_with_no_rows(self, sink):
         assert sink.filter_unrecorded({"t1", "t2"}) == {"t1", "t2"}
 
     def test_filter_unrecorded_drops_a_recorded_target(self, sink):
         sink._write_job(
-            job("J1", [artifact("a", LH_TABLE)], [artifact("b", LH_MODEL)]),
+            job("t1", [artifact("a", LH_TABLE)], [artifact("b", LH_MODEL)]),
             build_id="BLD",
             target_run_uuid="t1",
         )
@@ -205,7 +222,7 @@ class TestDedupByPresence:
         # this sink's row count, since one such event still fans out over its
         # inputs. Honouring it would report every target unrecorded forever.
         sink._write_job(
-            job("J1", [artifact("a", LH_TABLE)], [artifact("b", LH_MODEL)]),
+            job("t1", [artifact("a", LH_TABLE)], [artifact("b", LH_MODEL)]),
             build_id="BLD",
             target_run_uuid="t1",
         )
@@ -284,26 +301,36 @@ class TestReleaseCounts:
 
 
 class TestRowContents:
-    def test_promoted_pieces_come_from_the_identifier(self):
-        # Parsed back out of the identifier rather than threaded separately, so a
-        # column can never disagree with the identifier it describes.
+    def test_endpoint_detail_comes_from_the_artifact_dict(self):
+        """Kind and name are recorded, not derived from the URI.
+
+        Inferring ``model`` from an ``lh://.../models/...`` path would be a second
+        opinion about what an artifact is, free to diverge from the producer's.
+        """
         row = _row_from_draft(
             LineageRowDraft(
                 job_id="J1",
-                source="model:prod/ns::label|tbl",
-                target=None,
+                source="lh://prod/ns/models/tbl/label",
+                source_artifact={"name": "label", "artifact_type": "model"},
             ),
             build_id="BLD",
             target_run_uuid="TR",
         )
-        assert row.source_kind == "model"
-        assert row.source_namespace == "prod/ns"
-        assert row.source_name == "label"
-        assert row.source_table == "tbl"
+        assert endpoint_kind(row.attributes, SOURCE) == "model"
+        assert endpoint_name(row.attributes, SOURCE) == "label"
+
+    def test_the_uri_is_not_repeated_inside_the_blob(self):
+        """It is the row's identity; a second copy could only diverge from it."""
+        row = _row_from_draft(
+            LineageRowDraft(job_id="J1", source="lh://prod/ns/tables/t"),
+            build_id="BLD",
+            target_run_uuid="TR",
+        )
+        assert "uri" not in (row.attributes.get(SOURCE) or {})
 
     def test_none_endpoints_become_the_terminal_marker(self):
         row = _row_from_draft(
-            LineageRowDraft(job_id="J1", source=None, target="table:prod/ns::t"),
+            LineageRowDraft(job_id="J1", target="lh://prod/ns/tables/t"),
             build_id="BLD",
             target_run_uuid="TR",
         )
@@ -312,19 +339,44 @@ class TestRowContents:
         assert row.source == ""
         assert row.is_creation()
 
-    def test_rows_are_marked_derivable(self):
-        # A rebuild deletes only derivable rows, so imported lineage survives it.
+    def test_rows_record_the_producing_system(self):
         row = _row_from_draft(
-            LineageRowDraft(job_id="J1", source="table:prod/ns::t", target=None),
+            LineageRowDraft(job_id="J1", source="lh://prod/ns/tables/t"),
             build_id="BLD",
             target_run_uuid="TR",
         )
-        assert row.derivable is True
-        assert row.source_system == "granite.build"
+        assert origin_system(row.attributes) == "granite.build"
 
-    def test_the_real_uri_is_carried_onto_the_row(self, sink, rows):
-        # The scheme is not recoverable from a canonical identifier, so the URI has
-        # to travel rather than be re-derived on read.
+    def test_process_ids_are_carried_in_the_origin_group(self):
+        """Carried but not indexed: they are empty for every imported source."""
+        row = _row_from_draft(
+            LineageRowDraft(job_id="J1", source="lh://prod/ns/tables/t"),
+            build_id="BLD",
+            target_run_uuid="TR",
+        )
+        assert origin_id(row.attributes, "build_id") == "BLD"
+        assert origin_id(row.attributes, "target_run_uuid") == "TR"
+
+    def test_an_importer_carries_no_process_ids(self):
+        """A source with no build concept writes no empty id keys.
+
+        Omitting the group lets a reader tell "not recorded" from "recorded empty".
+        """
+        row = _row_from_draft(
+            LineageRowDraft(job_id="J1", source="lh://prod/ns/tables/t"),
+            build_id="",
+            target_run_uuid="",
+            source_system="lakehouse",
+        )
+        assert "ids" not in row.attributes["origin"]
+        assert origin_system(row.attributes) == "lakehouse"
+
+    def test_the_endpoints_are_the_normalized_uris(self, sink, rows):
+        """The URI is the identity, so it is normalized on the way in.
+
+        ``hf:///org/repo`` and the browser URL for the same repo must converge, or
+        one artifact becomes two disconnected halves of a graph.
+        """
         sink._write_job(
             job(
                 "J1",
@@ -335,8 +387,8 @@ class TestRowContents:
             target_run_uuid="TR",
         )
         stored = rows.get_rows_by_job("J1")[0]
-        assert stored.source_uri == "s3://bkt/raw"
-        assert stored.target_uri == "hf:///org/repo"
+        assert stored.source == "s3://bkt/raw"
+        assert stored.target == "hf://huggingface.co/models/org/repo"
 
     def test_carried_metadata_survives(self, sink, rows):
         sink._write_job(
@@ -351,8 +403,9 @@ class TestRowContents:
             target_run_uuid="TR",
         )
         stored = rows.get_rows_by_job("J1")[0]
-        assert stored.metadata["job_name"] == "train"
-        assert stored.metadata["owner"] == "alice"
+        job_group = job_detail(stored.attributes)
+        assert job_group["name"] == "train"
+        assert job_group["owner"] == "alice"
 
 
 class TestArtifactRegistrationRows:
@@ -360,14 +413,14 @@ class TestArtifactRegistrationRows:
 
     def test_rows_carry_no_target_run(self):
         # build_id holds the artifact uuid so count_release_ids finds them, while
-        # target_run_uuid stays empty: there is no target run.
+        # target_run_uuid is absent: there is no target run.
         row = _row_from_draft(
-            LineageRowDraft(job_id="ART-UUID", source="table:prod/ns::t", target=None),
+            LineageRowDraft(job_id="ART-UUID", source="lh://prod/ns/tables/t"),
             build_id="ART-UUID",
             target_run_uuid="",
         )
-        assert row.target_run_uuid == ""
-        assert row.build_id == "ART-UUID"
+        assert origin_id(row.attributes, "target_run_uuid") == ""
+        assert origin_id(row.attributes, "build_id") == "ART-UUID"
         # job_id still identifies the rows, so the composite unique keeps
         # protecting them without depending on a target run.
         assert row.job_id == "ART-UUID"
@@ -425,3 +478,58 @@ class TestJobNormalization:
 
         event = {"job_id": "J1", "sources": [], "targets": []}
         assert _normalized_job(event)["job_id"] == "J1"
+
+
+class TestNamespacePropagation:
+    """``job_namespace`` must survive the write path, or authorization eats the graph.
+
+    The read path splits it on the first ``/`` to recover the space and prunes nodes
+    the caller cannot see, failing closed when it is absent. So a row that loses it is
+    not merely missing a label: every node built from it disappears from every graph,
+    for every caller -- authorization behaving correctly on absent provenance, which
+    is indistinguishable from an empty index.
+
+    It is nested a third way in the builder's event (under ``job.namespace``, not
+    ``job_details``), which is exactly how it got dropped.
+    """
+
+    def test_the_namespace_is_lifted_out_of_the_job_block(self):
+        from gbserver.lineage.db_jobstats import _normalized_job
+
+        event = {
+            "job": {"namespace": "my-space/build-x", "name": "tgt"},
+            "job_details": {"job_id": "TR"},
+        }
+        assert _normalized_job(event)["job_namespace"] == "my-space/build-x"
+
+    def test_an_explicit_top_level_namespace_is_not_overwritten(self):
+        from gbserver.lineage.db_jobstats import _normalized_job
+
+        event = {
+            "job": {"namespace": "from-block"},
+            "job_namespace": "from-top-level",
+            "job_details": {"job_id": "TR"},
+        }
+        assert _normalized_job(event)["job_namespace"] == "from-top-level"
+
+    def test_a_missing_job_block_does_not_raise(self):
+        from gbserver.lineage.db_jobstats import _normalized_job
+
+        assert "job_namespace" not in _normalized_job({"job_details": {"job_id": "T"}})
+
+    def test_the_namespace_reaches_the_stored_row(self, sink, rows):
+        """End to end: the blob's job group carries it, so the graph can authorize."""
+        from gbserver.lineage.attributes import job_detail
+
+        sink._write_job(
+            {
+                "sources": [artifact("a", LH_TABLE)],
+                "targets": [artifact("b", LH_MODEL)],
+                "job": {"namespace": "my-space/build-x", "name": "tgt"},
+                "job_details": {"job_id": "TR", "owner": "someone"},
+            },
+            build_id="BLD",
+            target_run_uuid="TR",
+        )
+        stored = rows.get_rows_by_job("TR")[0]
+        assert job_detail(stored.attributes)["namespace"] == "my-space/build-x"

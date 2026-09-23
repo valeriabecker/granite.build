@@ -159,48 +159,6 @@ class TestSQLWalkAgainstRealStorage(HIDE_FROM_PYTEST.TestWalkAgainstRealStorage)
 
 
 @_SKIP_ADMIN
-class TestSQLRebuild(HIDE_FROM_PYTEST.TestRebuild):
-    """Rebuild deletes only derivable rows of one source system.
-
-    Overridden rather than inherited: the SQLite version asserts on the whole
-    table via ``get_by_where({})``, which here also sees the fixture's seed row.
-    """
-
-    def test_deletes_only_derivable_rows_of_that_system(self, storage):
-        storage.add(row(job_id="J1", source_system="granite.build", derivable=True))
-        storage.add(
-            row(
-                job_id="J2",
-                source_system="granite.build",
-                derivable=True,
-                target="dataset:h/ns::c|t",
-            )
-        )
-        storage.add(row(job_id="J3", source_system="lh", derivable=False))
-        storage.add(
-            row(
-                job_id="J4",
-                source_system="granite.build",
-                derivable=False,
-                target="dataset:h/ns::d|t",
-            )
-        )
-
-        # The seed row is derivable granite.build lineage too, so it is deleted
-        # alongside J1 and J2.
-        deleted = storage.delete_derivable_rows("granite.build")
-        assert deleted == 2 + _seeded(storage)
-
-        remaining = {r.job_id for r in storage.get_by_where({})}
-        assert remaining == {"J3", "J4"}
-
-
-# ---------------------------------------------------------------------------
-# Postgres-only: schema introspection and identifier limits.
-# ---------------------------------------------------------------------------
-
-
-@_SKIP_ADMIN
 class TestPostgresSchema:
     """The declared indexes and unique must exist in the real postgres table."""
 
@@ -235,15 +193,6 @@ class TestPostgresSchema:
         assert unique, definitions
         assert "(job_id, source, target)" in unique[0]
 
-    def test_derivable_is_not_indexed(self, storage):
-        """Deliberately unindexed: a bool, only ever compared for equality.
-
-        Indexing it would also invite batching a list against a non-string column,
-        which degrades silently rather than raising.
-        """
-        definitions = " ".join(self._index_definitions(storage))
-        assert "(derivable)" not in definitions, definitions
-
     def test_traversal_columns_are_text(self, storage):
         """``get_by_where`` only builds an ``IN`` clause for string columns."""
         rows = self._query(
@@ -253,9 +202,14 @@ class TestPostgresSchema:
             {"table": storage.table_name},
         )
         columns = {name: kind for name, kind in rows}
-        for column in ("source", "target", "job_id", "target_run_uuid", "build_id"):
+        for column in ("source", "target", "job_id"):
             assert columns[column] == "character varying", (column, columns[column])
-        assert columns["derivable"] == "boolean"
+        # Every promoted column is text, so there is no non-string type to assert.
+        # get_by_where builds an IN clause only for string columns and silently
+        # degrades otherwise, which is what that invariant protects against.
+        assert "derivable" not in columns
+        assert "build_id" not in columns
+        assert "target_run_uuid" not in columns
 
 
 @_SKIP_ADMIN

@@ -27,13 +27,21 @@ from gbserver.lineage.decompose import (
 )
 
 
-def identify(artifact: dict) -> str:
-    """Stand-in for canonical_id: the artifact's name is its identifier."""
-    return artifact["name"]
-
-
 def artifact(name: str, **extra) -> dict:
+    """An artifact dict whose URI is derived from a short name.
+
+    Endpoints are normalized URIs now, so the fixtures have to be real URIs -- a
+    bare name has no scheme and would be dropped, which is the behaviour the
+    "unidentifiable" tests assert on purpose.
+    """
+    if "uri" not in extra:
+        extra["uri"] = uri_for(name)
     return {"name": name, **extra}
+
+
+def uri_for(name: str) -> str:
+    """The URI the fixtures use for a given short name."""
+    return f"s3://bucket/{name}"
 
 
 def job(job_id: str = "J", sources=None, targets=None, **extra) -> dict:
@@ -47,29 +55,44 @@ def job(job_id: str = "J", sources=None, targets=None, **extra) -> dict:
 
 
 def pairs(rows) -> list[tuple]:
-    return [(row.source, row.target) for row in rows]
+    """Endpoint pairs, mapped back to short names so assertions stay readable.
+
+    A terminal stays "" -- it is a real value, not a missing one.
+    """
+    return [(unname(row.source), unname(row.target)) for row in rows]
+
+
+def unname(endpoint: str) -> str:
+    """Inverse of uri_for, so an assertion can talk in short names."""
+    prefix = "s3://bucket/"
+    return endpoint[len(prefix):] if endpoint.startswith(prefix) else endpoint
 
 
 class TestTerminals:
-    """source/target None is real information, not a missing value."""
+    """An empty endpoint is real information, not a missing value.
+
+    It is ``""`` rather than ``None`` so it survives SQL: NULL never equals NULL, so
+    NULL endpoints would slip past the ``(job_id, source, target)`` unique index and
+    leave creation/deletion rows as the only ones a re-ingest could duplicate.
+    """
 
     def test_no_targets_is_a_deletion_terminal(self):
         rows = to_lineage_rows(
-            job(sources=[artifact("a"), artifact("b")], targets=[]), identify
+            job(sources=[artifact("a"), artifact("b")], targets=[])
         )
-        assert pairs(rows) == [("a", None), ("b", None)]
+        assert pairs(rows) == [("a", ""), ("b", "")]
 
     def test_no_sources_is_a_creation_terminal(self):
-        rows = to_lineage_rows(job(sources=[], targets=[artifact("out")]), identify)
-        assert pairs(rows) == [(None, "out")]
+        rows = to_lineage_rows(job(sources=[], targets=[artifact("out")]))
+        assert pairs(rows) == [("", "out")]
 
     def test_creation_with_several_outputs(self):
-        rows = to_lineage_rows(job(targets=[artifact("x"), artifact("y")]), identify)
-        assert pairs(rows) == [(None, "x"), (None, "y")]
+        rows = to_lineage_rows(job(targets=[artifact("x"), artifact("y")]))
+        assert pairs(rows) == [("", "x"), ("", "y")]
 
     def test_missing_keys_behave_like_empty_lists(self):
-        rows = to_lineage_rows(job(targets=[artifact("out")]), identify)
-        assert pairs(rows) == [(None, "out")]
+        rows = to_lineage_rows(job(targets=[artifact("out")]))
+        assert pairs(rows) == [("", "out")]
 
 
 class TestFanShapes:
@@ -81,20 +104,18 @@ class TestFanShapes:
                 sources=[artifact("a"), artifact("b"), artifact("c")],
                 targets=[artifact("out")],
             ),
-            identify,
         )
         assert pairs(rows) == [("a", "out"), ("b", "out"), ("c", "out")]
 
     def test_one_source_many_targets(self):
         rows = to_lineage_rows(
             job(sources=[artifact("in")], targets=[artifact("x"), artifact("y")]),
-            identify,
         )
         assert pairs(rows) == [("in", "x"), ("in", "y")]
 
     def test_one_to_one(self):
         rows = to_lineage_rows(
-            job(sources=[artifact("in")], targets=[artifact("out")]), identify
+            job(sources=[artifact("in")], targets=[artifact("out")])
         )
         assert pairs(rows) == [("in", "out")]
 
@@ -116,7 +137,6 @@ class TestCartesianCase:
                     sources=[artifact("i1"), artifact("i2"), artifact("i3")],
                     targets=[artifact("o1"), artifact("o2")],
                 ),
-                identify,
             )
 
     def test_two_by_two_raises(self):
@@ -126,7 +146,6 @@ class TestCartesianCase:
                     sources=[artifact("a"), artifact("b")],
                     targets=[artifact("x"), artifact("y")],
                 ),
-                identify,
             )
 
     def test_fan_out_on_one_side_is_accepted(self):
@@ -137,7 +156,6 @@ class TestCartesianCase:
                 sources=[artifact("a"), artifact("b")],
                 targets=[artifact("x")],
             ),
-            identify,
         )
         assert pairs(many_sources) == [("a", "x"), ("b", "x")]
         assert {row.job_id for row in many_sources} == {"run-7"}
@@ -148,7 +166,6 @@ class TestCartesianCase:
                 sources=[artifact("a")],
                 targets=[artifact("x"), artifact("y")],
             ),
-            identify,
         )
         assert pairs(many_targets) == [("a", "x"), ("a", "y")]
         assert {row.job_id for row in many_targets} == {"run-8"}
@@ -174,40 +191,39 @@ class TestRegrouping:
                 sources=[artifact("i1"), artifact("i2"), artifact("i3")],
                 targets=[artifact("o1")],
             ),
-            identify,
         ) + to_lineage_rows(
             job(
                 job_id="J2",
                 sources=[artifact("i1"), artifact("i2"), artifact("i3")],
                 targets=[artifact("o2")],
             ),
-            identify,
         )
         grouped = group_by_job(rows)
-        assert grouped["J"]["sources"] == {"i1", "i2", "i3"}
-        assert grouped["J"]["targets"] == {"o1"}
-        assert grouped["J2"]["sources"] == {"i1", "i2", "i3"}
-        assert grouped["J2"]["targets"] == {"o2"}
+        expected_inputs = {uri_for("i1"), uri_for("i2"), uri_for("i3")}
+        assert grouped["J"]["sources"] == expected_inputs
+        assert grouped["J"]["targets"] == {uri_for("o1")}
+        assert grouped["J2"]["sources"] == expected_inputs
+        assert grouped["J2"]["targets"] == {uri_for("o2")}
 
     def test_terminals_regroup_without_none(self):
-        creation = to_lineage_rows(job("C", targets=[artifact("o")]), identify)
-        deletion = to_lineage_rows(job("D", sources=[artifact("i")]), identify)
+        creation = to_lineage_rows(job("C", targets=[artifact("o")]))
+        deletion = to_lineage_rows(job("D", sources=[artifact("i")]))
         grouped = group_by_job(creation + deletion)
         assert grouped["C"]["sources"] == set()
-        assert grouped["C"]["targets"] == {"o"}
-        assert grouped["D"]["sources"] == {"i"}
+        assert grouped["C"]["targets"] == {uri_for("o")}
+        assert grouped["D"]["sources"] == {uri_for("i")}
         assert grouped["D"]["targets"] == set()
 
     def test_several_jobs_stay_separate(self):
         rows = to_lineage_rows(
-            job("J1", sources=[artifact("a")], targets=[artifact("x")]), identify
+            job("J1", sources=[artifact("a")], targets=[artifact("x")])
         ) + to_lineage_rows(
-            job("J2", sources=[artifact("b")], targets=[artifact("y")]), identify
+            job("J2", sources=[artifact("b")], targets=[artifact("y")])
         )
         grouped = group_by_job(rows)
         assert set(grouped) == {"J1", "J2"}
-        assert grouped["J1"]["sources"] == {"a"}
-        assert grouped["J2"]["sources"] == {"b"}
+        assert grouped["J1"]["sources"] == {uri_for("a")}
+        assert grouped["J2"]["sources"] == {uri_for("b")}
 
 
 class TestSelfLoop:
@@ -215,7 +231,7 @@ class TestSelfLoop:
 
     def test_same_artifact_in_and_out(self):
         rows = to_lineage_rows(
-            job(sources=[artifact("tbl")], targets=[artifact("tbl")]), identify
+            job(sources=[artifact("tbl")], targets=[artifact("tbl")])
         )
         assert pairs(rows) == [("tbl", "tbl")]
 
@@ -230,7 +246,6 @@ class TestMetadata:
                 owner="someone",
                 job_status="SUCCESS",
             ),
-            identify,
         )
         for row in rows:
             assert row.metadata["job_name"] == "train"
@@ -240,13 +255,12 @@ class TestMetadata:
     def test_unknown_keys_are_not_carried(self):
         rows = to_lineage_rows(
             job(sources=[artifact("a")], targets=[artifact("x")], not_a_key="v"),
-            identify,
         )
         assert "not_a_key" not in rows[0].metadata
 
     def test_absent_metadata_is_omitted_not_defaulted(self):
         rows = to_lineage_rows(
-            job(sources=[artifact("a")], targets=[artifact("x")]), identify
+            job(sources=[artifact("a")], targets=[artifact("x")])
         )
         assert rows[0].metadata == {"job_id": "J"}
 
@@ -258,7 +272,6 @@ class TestMetadata:
                 targets=[artifact("x")],
                 job_name="n",
             ),
-            identify,
         )
         rows[0].metadata["job_name"] = "changed"
         assert rows[1].metadata["job_name"] == "n"
@@ -267,37 +280,57 @@ class TestMetadata:
         assert "job_id" in JOB_METADATA_KEYS
 
 
-class TestFilters:
-    """Partition filters are carried, though the traversal does not use them yet."""
+class TestPartitionFiltersAreOutOfScope:
+    """A draft carries no partition filter, on purpose.
 
-    def test_filters_are_taken_from_the_artifacts(self):
+    The old row had ``source_filter``/``target_filter`` columns that were always
+    ``None``: ``ArtifactRegistration`` has no filter or partition field, so no
+    producer could emit one, and the traversal never read them. They are gone rather
+    than carried empty.
+
+    If partitioned artifacts ever arrive, add normalization and traversal
+    propagation *together* -- a raw array-shaped filter and an equivalent
+    object-shaped one are different strings, so rows written before normalization
+    would never match once propagation starts comparing them.
+    """
+
+    def test_a_filter_on_the_artifact_is_ignored(self):
         rows = to_lineage_rows(
             job(
                 sources=[artifact("a", filter='{"dt":"2024"}')],
                 targets=[artifact("x", filter='{"dt":"2025"}')],
             ),
-            identify,
         )
-        assert rows[0].source_filter == '{"dt":"2024"}'
-        assert rows[0].target_filter == '{"dt":"2025"}'
+        assert not hasattr(rows[0], "source_filter")
+        assert not hasattr(rows[0], "target_filter")
 
-    def test_absent_filter_is_none(self):
+    def test_a_filtered_artifact_is_still_one_node(self):
+        """Two partitions of one table share a URI, so they share a node."""
         rows = to_lineage_rows(
-            job(sources=[artifact("a")], targets=[artifact("x")]), identify
+            job(
+                sources=[artifact("tbl", filter='{"dt":"2024"}')],
+                targets=[artifact("out")],
+            ),
         )
-        assert rows[0].source_filter is None
-        assert rows[0].target_filter is None
+        other = to_lineage_rows(
+            job(
+                job_id="J2",
+                sources=[artifact("tbl", filter='{"dt":"2025"}')],
+                targets=[artifact("out2")],
+            ),
+        )
+        assert rows[0].source == other[0].source
 
 
 class TestArtifactsAreCarried:
     def test_source_and_target_artifacts_are_kept(self):
         source, target = artifact("a", type="model"), artifact("x", type="dataset")
-        rows = to_lineage_rows(job(sources=[source], targets=[target]), identify)
+        rows = to_lineage_rows(job(sources=[source], targets=[target]))
         assert rows[0].source_artifact == source
         assert rows[0].target_artifact == target
 
     def test_terminal_rows_carry_only_one_side(self):
-        rows = to_lineage_rows(job(targets=[artifact("x")]), identify)
+        rows = to_lineage_rows(job(targets=[artifact("x")]))
         assert rows[0].source_artifact is None
         assert rows[0].target_artifact is not None
 
@@ -305,32 +338,52 @@ class TestArtifactsAreCarried:
 class TestRejectedInput:
     def test_missing_job_id_raises(self):
         with pytest.raises(LineageDecomposeError, match="job_id"):
-            to_lineage_rows({"sources": [artifact("a")]}, identify)
+            to_lineage_rows({"sources": [artifact("a")]})
 
     def test_empty_job_id_raises(self):
         with pytest.raises(LineageDecomposeError, match="job_id"):
-            to_lineage_rows(job("", sources=[artifact("a")]), identify)
+            to_lineage_rows(job("", sources=[artifact("a")]))
 
     def test_no_sources_and_no_targets_raises(self):
         with pytest.raises(LineageDecomposeError, match="neither sources nor targets"):
-            to_lineage_rows(job(sources=[], targets=[]), identify)
+            to_lineage_rows(job(sources=[], targets=[]))
 
-    def test_identify_errors_propagate(self):
-        """A rejected identifier must not be swallowed into a degraded row."""
+    def test_an_unidentifiable_endpoint_becomes_terminal_not_an_error(self):
+        """A URI with no identity rule ends a path; it does not abort the job.
 
-        def failing(_artifact: dict) -> str:
-            raise ValueError("bad identifier")
+        The endpoint is dropped rather than guessed -- an invented identity merges
+        unrelated artifacts, which is the one failure worth losing a node to avoid --
+        and the other endpoint of the row still records what it can. The drop is
+        logged by ``normalize_uri`` so a producer emitting an unsupported shape is
+        countable rather than silent.
+        """
+        rows = to_lineage_rows(
+            job(
+                sources=[{"name": "a", "uri": "bogus-scheme://nope"}],
+                targets=[artifact("x")],
+            ),
+        )
+        assert pairs(rows) == [("", "x")]
 
-        with pytest.raises(ValueError, match="bad identifier"):
-            to_lineage_rows(
-                job(sources=[artifact("a")], targets=[artifact("x")]), failing
-            )
+    def test_a_job_whose_every_endpoint_is_unidentifiable_still_decomposes(self):
+        """Nothing raises; the caller decides what to do with a row that says nothing.
+
+        ``db_jobstats`` drops such a row, because terminal-on-both-sides identifies
+        no artifact and would join unrelated jobs through the empty endpoint.
+        """
+        rows = to_lineage_rows(
+            job(
+                sources=[{"name": "a", "uri": "bogus://x"}],
+                targets=[{"name": "b", "uri": "bogus://y"}],
+            ),
+        )
+        assert pairs(rows) == [("", "")]
 
 
 class TestRowIdentity:
     def test_key_is_the_storage_unique_triple(self):
-        row = LineageRowDraft(job_id="J", source="a", target="b")
-        assert row.key() == ("J", "a", "b")
+        row = LineageRowDraft(job_id="J", source="s3://b/a", target="s3://b/b")
+        assert row.key() == ("J", "s3://b/a", "s3://b/b")
 
     def test_rows_of_one_job_have_distinct_keys(self):
         rows = to_lineage_rows(
@@ -338,6 +391,5 @@ class TestRowIdentity:
                 sources=[artifact("a"), artifact("b"), artifact("c")],
                 targets=[artifact("x")],
             ),
-            identify,
         )
         assert len({row.key() for row in rows}) == len(rows)

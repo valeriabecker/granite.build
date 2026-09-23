@@ -35,7 +35,7 @@ outputs becomes N*M flat rows sharing a ``job_id``. That is lossy only in
 appearance -- ``group_by_job`` recovers which inputs and which outputs an
 execution had -- and it is what makes each row an independently indexable edge.
 
-Dedup is by presence of ``target_run_uuid``, not by row count. A target either has
+Dedup is by presence of ``job_id``, not by row count. A job either has
 its rows or it does not. It deliberately does not compare against the reconciler's
 ``expected_counts``, which counts one W&B run per output artifact: that number
 never equals an N*M row count, so comparing would report every target as
@@ -45,7 +45,7 @@ unrecorded forever and re-record on every scan.
 import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
-from gbserver.lineage.artifact_identity import identity_from_artifact_dict
+from gbserver.lineage.attributes import build_attributes, origin_id
 from gbserver.lineage.decompose import LineageDecomposeError, to_lineage_rows
 from gbserver.lineage.jobstats import ILineageStore
 from gbserver.storage.artifact_registration import ArtifactRegistration
@@ -57,10 +57,9 @@ from gbserver.storage.stored_target_run import StoredTargetRun
 
 logger = logging.getLogger(__name__)
 
-# Marks rows this sink derived, as opposed to rows an importer supplied. A rebuild
-# deletes only derivable rows, so imported lineage survives it -- which matters
-# because imported lineage will not be re-derivable once its upstream sources are
-# switched off.
+# Names the system that produced a row, so rows this sink derived stay
+# distinguishable from rows an importer supplied. Surfaced on a run node as
+# ``source_system``; an importer passes its own name.
 SOURCE_SYSTEM = "granite.build"
 
 
@@ -163,9 +162,14 @@ class DBLineageStore(ILineageStore):
         if not isinstance(target, StoredTargetRun):
             return
 
-        if self.row_storage.has_rows_for_target_run(target.uuid):
+        if self.row_storage.has_rows_for_job(target.uuid):
             # Already recorded. Presence, not count: see the module docstring for
             # why a count comparison would re-record forever.
+            #
+            # Keyed on target.uuid because that IS the job id of build lineage --
+            # the event builder sets ``job_details.job_id = targetrun.uuid``
+            # (``wandb_jobstats.py:274``), so per-job dedup is per-target dedup here
+            # without the index needing a column for a target run.
             logger.debug("Target run %s already has lineage rows", target.uuid)
             return
 
@@ -185,12 +189,9 @@ class DBLineageStore(ILineageStore):
         the scan: one unrecordable target must not stop the rest of a build's
         lineage from landing. The reason is logged with it -- a bare "skipping"
         makes lineage loss undiagnosable, and lineage this index misses is not
-        re-derivable once the upstream sources are switched off.
         """
         try:
-            drafts = to_lineage_rows(
-                _normalized_job(job), identify=identity_from_artifact_dict
-            )
+            drafts = to_lineage_rows(_normalized_job(job))
         except LineageDecomposeError as exc:
             logger.warning(
                 "Job entry could not be decomposed into lineage rows; skipping "
@@ -202,7 +203,7 @@ class DBLineageStore(ILineageStore):
             return
 
         for draft in drafts:
-            if draft.source is None and draft.target is None:
+            if not draft.source and not draft.target:
                 # Both endpoints unidentifiable: the row would be terminal on both
                 # sides, which identifies nothing and would join unrelated jobs.
                 continue
@@ -282,19 +283,18 @@ class DBLineageStore(ILineageStore):
     def count_release_ids(
         self, release_id: str, target_id: Optional[str] = None
     ) -> int:
-        """Count the lineage ROWS recorded for a release.
+        """Count the lineage rows recorded for a release.
 
-        ``release_id`` is a ``build_id`` for build lineage, and the artifact's uuid
-        for a registered artifact -- the same convention the W&B sink uses, so the
-        same argument works against either.
+        ``release_id`` is a ``build_id`` for build lineage and the artifact's uuid
+        for a registered artifact -- W&B's convention, kept so the same argument
+        works against either sink.
 
-        **The unit is rows, not W&B runs, and the two numbers differ.** W&B creates
-        one run per (target, output artifact); this sink writes one row per
-        (input, output) pair. A build with 2 inputs and 5 outputs is 5 runs there
-        and 10 rows here. So a caller comparing against a count computed in W&B's
-        shape -- as :meth:`does_release_id_exist` does -- will not match. That is
-        the same shape mismatch that made row-count dedup unusable, which is why
-        recording dedup is presence-based instead.
+        Neither of those is a column here: the index is keyed by artifact URI and
+        job, and a build id lives in the unqueryable ``attributes`` blob. So this
+        pages and filters in Python. It is only used by W&B-shaped callers (no
+        production caller outside that sink), and a scan is the honest cost of
+        answering a question this schema is not organized around -- as opposed to
+        adding a column that would be blank on every imported row.
 
         Args:
             release_id: the build uuid, or the artifact uuid.
@@ -305,10 +305,17 @@ class DBLineageStore(ILineageStore):
         """
         if not release_id:
             return 0
-        where: dict = {"build_id": release_id}
-        if target_id:
-            where["target_run_uuid"] = target_id
-        return len(self.row_storage.get_by_where(where))
+        matched = 0
+        for page in self.row_storage.get_paged():
+            for row in page:
+                if origin_id(row.attributes, "build_id") != release_id:
+                    continue
+                if target_id and (
+                    origin_id(row.attributes, "target_run_uuid") != target_id
+                ):
+                    continue
+                matched += 1
+        return matched
 
     def does_release_id_exist(
         self, release_id: str, expected_count: int, target_id: Optional[str] = None
@@ -316,8 +323,11 @@ class DBLineageStore(ILineageStore):
         """Whether a release has exactly ``expected_count`` rows recorded.
 
         Kept for interface compatibility. Mind the unit: ``expected_count`` is
-        compared against a ROW count (see :meth:`count_release_ids`), so a count
-        derived from W&B's one-run-per-output shape will not match here.
+        compared against a ROW count, and W&B creates one run per (target, output
+        artifact) while this sink writes one row per (input, output) pair -- a build
+        with 2 inputs and 5 outputs is 5 runs there and 10 rows here. A count
+        computed in W&B's shape will not match. That same mismatch is why recording
+        dedup is presence-based rather than count-based.
         """
         return self.count_release_ids(release_id, target_id) == expected_count
 
@@ -335,6 +345,12 @@ class DBLineageStore(ILineageStore):
         instead -- a target's rows are written together, so it either has them or
         it does not.
 
+        The candidates are target run uuids, and they are looked up as *job* ids,
+        which is correct rather than a coincidence: the event builder stamps
+        ``job_details.job_id = targetrun.uuid`` (``wandb_jobstats.py:274``), so a
+        target run and its job share one identifier. That is what lets the index
+        drop its ``target_run_uuid`` column without weakening dedup.
+
         Fails **open**, and invokes ``on_query_error``: on a query failure every
         candidate is reported unrecorded. Re-recording is idempotent, so that is
         harmless, and the reconciler is what decides not to record at all (it fails
@@ -344,7 +360,7 @@ class DBLineageStore(ILineageStore):
         if not target_ids:
             return set()
         try:
-            recorded = self.row_storage.get_recorded_target_runs(list(target_ids))
+            recorded = self.row_storage.get_recorded_jobs(list(target_ids))
         except Exception as exc:
             logger.warning("Lineage dedup query failed; treating all as unrecorded")
             if on_query_error is not None:
@@ -400,6 +416,18 @@ def _normalized_job(job: dict) -> dict:
     # (job_id) or mirrors the same values.
     if details.get("job_id"):
         normalized["job_id"] = details["job_id"]
+
+    # The namespace lives under the event's "job" block as
+    # f"{space_name}/{build_name}" (_build_events_for_target), a third nesting the
+    # decomposer does not know about. Lifted because the read path splits it to
+    # recover the space and prune nodes the caller cannot see: a row without it
+    # fails closed, so losing it here makes every node built from this event vanish
+    # from every graph -- authorization working correctly on absent provenance,
+    # which looks exactly like an empty index.
+    job_block = job.get("job") or {}
+    namespace = job_block.get("namespace")
+    if namespace and not normalized.get("job_namespace"):
+        normalized["job_namespace"] = namespace
     return normalized
 
 
@@ -408,17 +436,19 @@ def _row_from_draft(
     build_id: str,
     target_run_uuid: str,
     source_system: str = SOURCE_SYSTEM,
-    derivable: bool = True,
 ) -> StoredLineageRow:
     """Turn a decomposed draft into the stored row.
 
-    ``None`` endpoints become :data:`TERMINAL`, not NULL: in SQL, NULL never equals
-    NULL, so NULL endpoints would slip past the unique index and leave
+    An empty endpoint stays :data:`TERMINAL` (``""``), not NULL: in SQL, NULL never
+    equals NULL, so NULL endpoints would slip past the unique index and leave
     creation/deletion rows as the only ones a re-ingest could duplicate.
 
-    The promoted pieces are parsed back out of the canonical identifier rather than
-    threaded separately, so a column can never disagree with the identifier it
-    describes -- they have one source.
+    Everything that is not ``job_id``/``source``/``target`` goes into the row's
+    ``attributes`` blob, whose shape is defined by
+    :mod:`gbserver.lineage.attributes` -- including the two process ids, which are
+    deliberately not columns: a build and a target run are granite.build's own
+    concepts and are empty for every imported source, so indexing them would index
+    blanks over most of the table.
 
     Args:
         draft: the decomposed row.
@@ -428,53 +458,16 @@ def _row_from_draft(
         source_system: which system the row came from. Defaults to this sink's
             own :data:`SOURCE_SYSTEM`; an importer passes its own name so its rows
             are distinguishable from the ones the scan derives.
-        derivable: whether a re-scan can regenerate the row. Defaults to ``True``
-            because the scan can. An importer MUST pass ``False``: a rebuild
-            deletes only derivable rows, so imported lineage marked derivable would
-            be destroyed by the next rebuild and -- unlike scanned lineage -- it
-            cannot be re-derived once its upstream source is switched off.
     """
-    from gbserver.lineage.identity import LineageIdentityError, parse_canonical_id
-
-    def pieces(identifier: Optional[str]) -> dict:
-        if not identifier:
-            return {}
-        try:
-            identity = parse_canonical_id(identifier)
-        except LineageIdentityError:
-            return {}
-        return {
-            "kind": identity.artifact_type.value or "",
-            "namespace": identity.namespace,
-            "name": identity.name,
-            "table": identity.table,
-            "revision": identity.revision,
-        }
-
-    source_pieces = pieces(draft.source)
-    target_pieces = pieces(draft.target)
-
     return StoredLineageRow(
         job_id=draft.job_id,
         source=draft.source or TERMINAL,
         target=draft.target or TERMINAL,
-        source_uri=draft.source_uri,
-        target_uri=draft.target_uri,
-        source_filter=draft.source_filter,
-        target_filter=draft.target_filter,
-        source_kind=source_pieces.get("kind", ""),
-        source_namespace=source_pieces.get("namespace", ""),
-        source_name=source_pieces.get("name", ""),
-        source_table=source_pieces.get("table", ""),
-        source_revision=source_pieces.get("revision", ""),
-        target_kind=target_pieces.get("kind", ""),
-        target_namespace=target_pieces.get("namespace", ""),
-        target_name=target_pieces.get("name", ""),
-        target_table=target_pieces.get("table", ""),
-        target_revision=target_pieces.get("revision", ""),
-        source_system=source_system,
-        derivable=derivable,
-        build_id=build_id,
-        target_run_uuid=target_run_uuid,
-        metadata=dict(draft.metadata or {}),
+        attributes=build_attributes(
+            job_metadata=draft.metadata,
+            source_artifact=draft.source_artifact,
+            target_artifact=draft.target_artifact,
+            source_system=source_system,
+            ids={"build_id": build_id, "target_run_uuid": target_run_uuid},
+        ),
     )

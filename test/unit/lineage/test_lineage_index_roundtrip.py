@@ -33,6 +33,8 @@ import pytest
 from gbcommon.uri.lh import LhURI
 from gbserver.lineage.db_jobstats import DBLineageStore
 from gbserver.lineage.db_service import DBLineageService
+from gbserver.lineage.attributes import origin_id
+from gbserver.lineage.uri_normalize import normalize_uri
 from gbserver.storage.artifact_registration import ArtifactRegistration
 from gbserver.storage.sqlite.storage_factory import SqliteStorageFactory
 from gbserver.storage.stored_build import StoredBuild
@@ -132,6 +134,16 @@ def add_target(storage, build, inputs: dict, outputs: dict) -> StoredTargetRun:
     return target
 
 
+def all_rows(storage) -> list:
+    """Every row in the index.
+
+    There is no build-scoped query: a build is not a column, because it is
+    granite.build's own concept and empty on every imported row. These fixtures
+    write one build, so the whole table IS that build's rows.
+    """
+    return [row for page in storage.lineage_row_storage.get_paged() for row in page]
+
+
 def artifact_ids(graph: dict) -> set:
     return {n["id"] for n in graph["nodes"] if n["node_type"] == "artifact"}
 
@@ -158,19 +170,26 @@ class TestOneHop:
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
         # The regression guard: an empty index here means the job entries were
         # silently rejected, which is what a nested job_id caused.
-        assert len(storage.lineage_row_storage.get_rows_by_build(self.build.uuid)) == 1
+        assert len(all_rows(storage)) == 1
 
     def test_the_row_connects_the_two_artifacts(self, storage):
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
-        row = storage.lineage_row_storage.get_rows_by_build(self.build.uuid)[0]
-        assert row.source == "table:staging/ns::raw_tbl"
-        assert row.target == "model:staging/ns::trained|mdl_tbl"
+        row = all_rows(storage)[0]
+        assert row.source == normalize_uri(self.raw.uri)
+        assert row.target == normalize_uri(self.model.uri)
 
-    def test_the_row_carries_the_real_uris(self, storage):
+    def test_the_endpoints_are_the_registered_uris(self, storage):
+        """No separate URI column: the endpoint IS the URI.
+
+        The old row carried ``source_uri``/``target_uri`` because a canonical
+        identifier did not encode a scheme. With the URI as the identity the pair
+        would be one string stored twice.
+        """
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
-        row = storage.lineage_row_storage.get_rows_by_build(self.build.uuid)[0]
-        assert row.source_uri == self.raw.uri
-        assert row.target_uri == self.model.uri
+        row = all_rows(storage)[0]
+        assert row.source == normalize_uri(self.raw.uri)
+        assert row.target == normalize_uri(self.model.uri)
+        assert not hasattr(row, "source_uri")
 
     def test_downstream_reaches_the_model(self, storage):
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
@@ -178,7 +197,7 @@ class TestOneHop:
             artifact_url=self.raw.uri, direction="downstream"
         )
         assert graph is not None
-        assert "model:staging/ns::trained|mdl_tbl" in artifact_ids(graph)
+        assert normalize_uri(self.model.uri) in artifact_ids(graph)
 
     def test_upstream_reaches_the_raw_table(self, storage):
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
@@ -186,20 +205,22 @@ class TestOneHop:
             artifact_url=self.model.uri, direction="upstream"
         )
         assert graph is not None
-        assert "table:staging/ns::raw_tbl" in artifact_ids(graph)
+        assert normalize_uri(self.raw.uri) in artifact_ids(graph)
 
     def test_the_served_graph_reports_the_registered_uri(self, storage):
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
         graph = self.service.get_artifact_graph(
             artifact_url=self.raw.uri, direction="downstream"
         )
-        node = next(n for n in graph["nodes"] if n["id"] == "table:staging/ns::raw_tbl")
+        node = next(
+            n for n in graph["nodes"] if n["id"] == normalize_uri(self.raw.uri)
+        )
         assert node["metadata"]["uri"] == self.raw.uri
 
     def test_recording_twice_does_not_duplicate(self, storage):
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
-        assert len(storage.lineage_row_storage.get_rows_by_build(self.build.uuid)) == 1
+        assert len(all_rows(storage)) == 1
 
     def test_a_recorded_target_is_filtered_out(self, storage):
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
@@ -208,12 +229,22 @@ class TestOneHop:
     def test_an_unrecorded_target_is_reported(self, storage):
         assert self.sink.filter_unrecorded({self.target.uuid}) == {self.target.uuid}
 
-    def test_an_unknown_artifact_is_not_found(self, storage):
+    def test_an_unidentifiable_uri_is_not_found(self, storage):
+        """``None`` means "cannot key on this", never "nothing recorded".
+
+        It becomes the 404 the frontend renders as "lineage is not available", so a
+        URI that resolves but has no rows must return its own node instead.
+        """
         self.sink.add_jobstats_for_build(storage, self.build.uuid)
-        assert (
-            self.service.get_artifact_graph(artifact_url="lh://prod/ns/tables/absent")
-            is None
+        assert self.service.get_artifact_graph(artifact_url="bogus://x") is None
+
+    def test_a_valid_uri_with_no_rows_is_an_empty_graph(self, storage):
+        self.sink.add_jobstats_for_build(storage, self.build.uuid)
+        graph = self.service.get_artifact_graph(
+            artifact_url="lh://prod/ns/tables/absent"
         )
+        assert graph is not None
+        assert artifact_ids(graph) == {"lh://prod/ns/tables/absent"}
 
 
 class TestFanOutRows:
@@ -241,13 +272,16 @@ class TestFanOutRows:
         sink = DBLineageStore(storage=storage.lineage_row_storage)
         sink.add_jobstats_for_build(storage, build.uuid)
 
-        rows = storage.lineage_row_storage.get_rows_by_build(build.uuid)
+        rows = all_rows(storage)
         assert len(rows) == 4
         # One execution, so every row shares the job identity -- which is what
         # keeps the flattening recoverable. job_id is the target run's uuid, so
         # the per-output split does not fragment it.
         assert len({r.job_id for r in rows}) == 1
-        assert {r.target_run_uuid for r in rows} == {target.uuid}
+        # The target run id is carried in the blob's origin group, not a column.
+        assert {origin_id(r.attributes, "target_run_uuid") for r in rows} == {
+            target.uuid
+        }
 
     def test_the_graph_regroups_them_into_one_run(self, storage):
         build = add_build(storage)
@@ -270,8 +304,8 @@ class TestFanOutRows:
         runs = [n for n in graph["nodes"] if n["node_type"] == "run"]
         assert len(runs) == 1
         assert artifact_ids(graph) >= {
-            "table:staging/ns::in_a",
-            "table:staging/ns::in_b",
+            normalize_uri(in_a.uri),
+            normalize_uri(in_b.uri),
         }
 
 
@@ -304,12 +338,18 @@ class TestChainAcrossBuilds:
             artifact_url=raw.uri, direction="downstream", max_depth=10
         )
         assert artifact_ids(graph) >= {
-            "table:staging/ns::raw_tbl",
-            "model:staging/ns::mid|mdl_tbl",
-            "model:staging/ns::final|mdl_tbl",
+            normalize_uri(raw.uri),
+            normalize_uri(mid.uri),
+            normalize_uri(final.uri),
         }
 
-    def test_a_build_scoped_graph_stays_inside_its_build(self, storage):
+    def test_a_build_seeded_graph_follows_the_chain_out_of_its_build(self, storage):
+        """Scope is now chosen by seeds, not by a row filter.
+
+        ``within_build_only`` filtered on a ``build_id`` column the index no longer
+        has. A build's own artifacts are the seeds; the walk follows the chain from
+        there, which is the point of a cross-build index.
+        """
         build1 = add_build(storage)
         raw = add_table(storage, "raw_tbl")
         t1_uuid = str(uuid_module.uuid4())
@@ -329,14 +369,18 @@ class TestChainAcrossBuilds:
         sink.add_jobstats_for_build(storage, build1.uuid)
         sink.add_jobstats_for_build(storage, build2.uuid)
 
-        service = DBLineageService(storage=storage.lineage_row_storage)
-        scoped = service.get_build_graph(
-            build1.uuid, direction="downstream", within_build_only=True
+        service = DBLineageService(
+            storage=storage.lineage_row_storage, admin_storage=storage
         )
-        assert "model:staging/ns::final|mdl_tbl" not in artifact_ids(scoped)
-
         crossing = service.get_build_graph(build1.uuid, direction="downstream")
-        assert "model:staging/ns::final|mdl_tbl" in artifact_ids(crossing)
+        assert normalize_uri(final.uri) in artifact_ids(crossing)
+
+        # And a caller wanting only build1's own artifacts asks about those, rather
+        # than asking the index to filter on a concept it does not model.
+        own = service.get_artifact_graph(
+            artifact_url=raw.uri, direction="downstream", max_depth=1
+        )
+        assert normalize_uri(final.uri) not in artifact_ids(own)
 
 
 class TestErrors:

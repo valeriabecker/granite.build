@@ -41,8 +41,15 @@ into one shared "nothing" node.
 import logging
 from typing import Optional
 
-from gbserver.lineage.identity import LineageIdentityError, parse_canonical_id
-from gbserver.lineage.node_uri import node_uri
+from gbserver.lineage.attributes import (
+    SOURCE,
+    TARGET,
+    endpoint_kind,
+    endpoint_name,
+    job_detail,
+    origin_id,
+    origin_system,
+)
 from gbserver.lineage.walk import LineageGraph
 from gbserver.storage.stored_lineage_row import TERMINAL, StoredLineageRow
 
@@ -53,33 +60,30 @@ logger = logging.getLogger(__name__)
 NODE_TYPE_ARTIFACT = "artifact"
 NODE_TYPE_RUN = "run"
 
-# Run-node metadata keys the API handler reads off a run node to build an
-# ArtifactRunEntry. Listed so a row's carried metadata is copied under the names
-# the handler expects rather than whatever the sink happened to store.
-_RUN_METADATA_KEYS = (
-    "job_name",
-    "job_namespace",
-    "job_type",
-    "run_id",
-    "created_at",
-    "state",
-    "job_id",
-    "job_status",
-    "job_started_at",
-    "job_completed_at",
-    "release_id",
-    "category",
-    "owner",
-    "source_code_details",
-    "job_input_params",
-    "execution_stats",
-    "job_output_stats",
-)
+# The run-node metadata keys the API handler reads to build an ArtifactRunEntry,
+# mapped from the ``job`` group of the row's attributes blob. Listed as data so the
+# handler's expected names and the blob's contract are translated in one visible
+# place rather than by a chain of lookups.
+#
+# Four of the handler's fields are absent on purpose: job_input_params,
+# execution_stats, job_output_stats and source_code_details are not carried by the
+# index (they are large and identical across every row of one job -- see
+# gbserver.lineage.attributes). They default to {} in the wire model, and a caller
+# needing them asks GET /lineage/target/{id}, which reads them from build state.
+_RUN_METADATA_FROM_JOB = {
+    "name": "job_name",
+    "namespace": "job_namespace",
+    "type": "job_type",
+    "status": "job_status",
+    "started_at": "job_started_at",
+    "completed_at": "job_completed_at",
+    "category": "category",
+    "owner": "owner",
+}
 
 
 def build_graph_dict(
     graph: LineageGraph,
-    root_identifier: str,
     root_uri: str = "",
     root_is_artifact: bool = True,
 ) -> dict:
@@ -88,24 +92,40 @@ def build_graph_dict(
     Args:
         graph: the walk result, as returned by
             :func:`~gbserver.lineage.walk.walk_lineage`.
-        root_identifier: what the graph is *about*. It becomes ``root_id``.
-        root_uri: the root artifact's real URI when the caller knows it, e.g.
-            because the request supplied one. Rows carry their own URIs, so this is
-            only a fallback for a root that appears in no row -- an artifact with no
-            lineage yet.
-        root_is_artifact: whether ``root_identifier`` names an artifact. ``False``
-            for a build-seeded graph, where it names a build: a build is not a node,
-            so nothing is flagged ``is_root`` and no node is synthesized for it.
-            Defaulting this to ``True`` would mint a bogus artifact node named after
-            the build and flag it as the root artifact.
+        root_uri: the normalized URI the graph is *about*. It becomes ``root_id``,
+            because a node's URI is its identity -- there is no separate identifier
+            to reconcile it against any more.
+        root_is_artifact: whether ``root_uri`` names an artifact. ``False`` for a
+            build-seeded graph, which has several roots and no single one to flag:
+            nothing is marked ``is_root`` and no node is synthesized. Defaulting
+            this to ``True`` would mint a bogus artifact node named after the build.
 
     Returns:
         ``{root_id, nodes, edges, truncated}``. An empty artifact graph yields the
         root node alone with no edges: "nothing recorded" is a real answer and must
         not read as an error.
+
+    **Self-loops are collapsed.** A row whose source equals its target is an in-place
+    rewrite -- an append to a dataset, a table refreshed in place -- and real data is
+    full of them: 30.4% of an imported Lakehouse graph, with one dataset appended
+    68,905 times. Rendering one run node per such row produced a 55 MB response
+    describing a single artifact.
+
+    Collapsing costs nothing in reachability, which is what makes it safe to do here
+    rather than as a cap: the traversal already refuses to chain *through* a self-loop
+    (see :func:`~gbserver.lineage.walk._walk_one_direction`), so those runs expand no
+    frontier and reach no artifact the graph would otherwise miss. They are pure
+    volume.
+
+    The collapsed node keeps a ``run_count`` and the id of one representative run, and
+    the full list stays available from ``GET /lineage/runs?uri=...`` -- indexed, paged,
+    and never truncated. Nothing is lost, only moved off the graph response.
     """
     artifact_nodes: dict[str, dict] = {}
     run_nodes: dict[str, dict] = {}
+    # Self-looped rows, grouped by the artifact they rewrite. Collected first so one
+    # collapsed node can carry the count, rather than emitting a node per row.
+    self_loop_rows: dict[str, list] = {}
     edges: list[dict] = []
     edge_keys: set[tuple[str, str]] = set()
 
@@ -117,6 +137,10 @@ def build_graph_dict(
         edges.append({"source": source, "target": target})
 
     for row in graph.rows:
+        if row.is_self_loop():
+            self_loop_rows.setdefault(row.source, []).append(row)
+            continue
+
         run_id = _run_node_id(row)
         if run_id not in run_nodes:
             run_nodes[run_id] = _run_node(row, run_id)
@@ -124,39 +148,56 @@ def build_graph_dict(
         if row.source != TERMINAL:
             _ensure_artifact_node(
                 artifact_nodes,
-                identifier=row.source,
-                uri=row.source_uri,
-                kind=row.source_kind,
-                name=row.source_name,
+                uri=row.source,
+                kind=endpoint_kind(row.attributes, SOURCE),
+                name=endpoint_name(row.attributes, SOURCE),
+                depth=graph.depths.get(row.source),
             )
             add_edge(row.source, run_id)
 
         if row.target != TERMINAL:
             _ensure_artifact_node(
                 artifact_nodes,
-                identifier=row.target,
-                uri=row.target_uri,
-                kind=row.target_kind,
-                name=row.target_name,
+                uri=row.target,
+                kind=endpoint_kind(row.attributes, TARGET),
+                name=endpoint_name(row.attributes, TARGET),
+                depth=graph.depths.get(row.target),
             )
             add_edge(run_id, row.target)
 
-    if root_is_artifact and root_identifier:
+    # One node per self-rewritten artifact, in place of one per row.
+    for uri, rows in self_loop_rows.items():
+        _ensure_artifact_node(
+            artifact_nodes,
+            uri=uri,
+            kind=endpoint_kind(rows[0].attributes, SOURCE),
+            name=endpoint_name(rows[0].attributes, SOURCE),
+            depth=graph.depths.get(uri),
+        )
+        run_id = _self_loop_node_id(uri)
+        run_nodes[run_id] = _self_loop_node(rows, run_id)
+        # Both directions, so the rewrite reads as a cycle on the artifact rather than
+        # a dangling node. The edge set dedups, so this is two edges however many rows
+        # collapsed into it.
+        add_edge(uri, run_id)
+        add_edge(run_id, uri)
+
+    if root_is_artifact and root_uri:
         # The root may appear in no row -- an artifact with no lineage recorded yet.
         # It still has to be in the graph, or the response would describe a
         # different artifact than the one that was asked about.
-        if root_identifier not in artifact_nodes:
+        if root_uri not in artifact_nodes:
             _ensure_artifact_node(
                 artifact_nodes,
-                identifier=root_identifier,
                 uri=root_uri,
                 kind="",
                 name="",
+                depth=graph.depths.get(root_uri, 0),
             )
-        artifact_nodes[root_identifier]["is_root"] = True
+        artifact_nodes[root_uri]["is_root"] = True
 
     return {
-        "root_id": root_identifier,
+        "root_id": root_uri,
         "nodes": list(artifact_nodes.values()) + list(run_nodes.values()),
         "edges": edges,
         "truncated": graph.truncated,
@@ -165,46 +206,101 @@ def build_graph_dict(
 
 def _ensure_artifact_node(
     nodes: dict[str, dict],
-    identifier: str,
     uri: str,
     kind: str,
     name: str,
+    depth: Optional[int] = None,
 ) -> None:
-    """Add an artifact node for ``identifier`` if it is not already present.
+    """Add an artifact node for ``uri`` if it is not already present.
 
-    Keyed by canonical identifier, so the same artifact reached along several paths
-    is one node -- the deduplication the graph depends on, done on identity rather
-    than on the URI. The URI still matters because it is what the *frontend*
-    deduplicates by downstream (see :mod:`gbserver.lineage.node_uri`).
+    Keyed by the normalized URI, which is both the graph's identity and what the
+    frontend deduplicates by -- the two used to be different things, and keeping
+    them in step was the reason a separate URI column existed.
 
-    First writer wins. Two rows describing one artifact carry the same promoted
-    pieces by construction (they are derived from its identifier), so there is
-    nothing to reconcile; re-deriving on every mention would only cost parses.
+    **First writer wins.** A URI has one artifact type by decision, so the first row
+    to mention it settles what it is; nothing here reconciles a later disagreement.
+    Kind and name come from the ``attributes`` blob, so a row written by a producer
+    that recorded neither leaves them to the URI-derived fallback rather than
+    showing an unnamed node.
+
+    Args:
+        nodes: the accumulator, keyed by URI.
+        uri: the artifact's normalized URI.
+        kind: its artifact type, if the row carried one.
+        name: its display name, if the row carried one.
+        depth: hops from the seed, when the walk reached it.
     """
-    if identifier in nodes:
+    if uri in nodes:
         return
 
-    display_name = name
-    artifact_type: Optional[str] = kind or None
-    if not display_name or not artifact_type:
-        # Rows written by an importer may not have promoted every piece. The
-        # identifier always carries them, so fall back to parsing it rather than
-        # showing a node with no name.
-        try:
-            identity = parse_canonical_id(identifier)
-        except LineageIdentityError:
-            logger.debug("Unparseable lineage identifier in graph: %r", identifier)
-        else:
-            display_name = display_name or identity.name or identity.table
-            artifact_type = artifact_type or (identity.artifact_type.value or None)
-
-    nodes[identifier] = {
-        "id": identifier,
+    nodes[uri] = {
+        "id": uri,
         "node_type": NODE_TYPE_ARTIFACT,
-        "name": display_name or identifier,
-        "artifact_type": artifact_type,
+        "name": name or _name_from_uri(uri),
+        "artifact_type": kind or None,
         "is_root": False,
-        "metadata": {"uri": node_uri(identifier, uri)},
+        "depth": depth,
+        "metadata": {"uri": uri},
+    }
+
+
+def _name_from_uri(uri: str) -> str:
+    """A display name for a URI whose row carried none.
+
+    The last non-empty path segment, which is the artifact's own name in every
+    scheme this index stores (a model label, a table name, an object key). Falls
+    back to the whole URI rather than to an empty label: a node with no name is
+    worse to look at than a long one.
+    """
+    if not uri:
+        return ""
+    without_scheme = uri.split("://", 1)[-1]
+    segments = [segment for segment in without_scheme.split("/") if segment]
+    return segments[-1] if segments else uri
+
+
+def _self_loop_node_id(uri: str) -> str:
+    """Identity of the node standing in for every in-place rewrite of one artifact.
+
+    Keyed by artifact rather than by job, which is the whole point: the rows being
+    collapsed have distinct ``job_id``s and that is exactly the multiplicity being
+    removed. Prefixed like a run node so it cannot collide with an artifact URI in the
+    shared id space, and distinctly from ``run:`` so a client can tell a collapsed node
+    from a real one without inspecting metadata.
+    """
+    return f"runs:{uri}"
+
+
+def _self_loop_node(rows: list, run_id: str) -> dict:
+    """Build the collapsed node for one artifact's in-place rewrites.
+
+    Carries the count and one representative job id. The representative is the first
+    row walked, not a choice of "most recent" -- ordering rows by time would need a
+    timestamp the blob does not promise, and claiming a "latest" that is not one is
+    worse than not claiming it.
+    """
+    representative = rows[0]
+    metadata = {
+        "run_count": len(rows),
+        "collapsed": True,
+        "representative_job_id": representative.job_id,
+        "source_system": origin_system(representative.attributes),
+    }
+    job = job_detail(representative.attributes)
+    if job.get("namespace"):
+        # Kept so the per-run space filter on POST /artifact still has something to
+        # read; without it a collapsed node fails closed and vanishes from that route.
+        metadata["job_namespace"] = job["namespace"]
+    if job.get("owner"):
+        metadata["owner"] = job["owner"]
+
+    return {
+        "id": run_id,
+        "node_type": NODE_TYPE_RUN,
+        "name": f"{len(rows)} in-place rewrites",
+        "artifact_type": None,
+        "is_root": False,
+        "metadata": metadata,
     }
 
 
@@ -217,7 +313,7 @@ def _run_node_id(row: StoredLineageRow) -> str:
 
     Prefixed so a run node id can never equal an artifact node id. They share one
     id space in the wire graph -- edges reference plain strings -- and a job_id that
-    happened to look like a canonical identifier would otherwise fuse a run and an
+    happened to look like an artifact URI would otherwise fuse a run and an
     artifact into one node.
     """
     return f"run:{row.job_id}"
@@ -226,32 +322,42 @@ def _run_node_id(row: StoredLineageRow) -> str:
 def _run_node(row: StoredLineageRow, run_id: str) -> dict:
     """Build the run node for a row's job execution.
 
-    The metadata a row carries lives in its JSON blob; the API handler reads
-    specific keys off a run node's metadata to assemble an ``ArtifactRunEntry``, so
-    only those are copied, under those names.
+    The job's detail lives in the ``job`` group of the row's attributes blob; only
+    the keys the API handler reads are copied out, under the names it expects.
 
     ``job_namespace`` is load-bearing beyond display: the handler splits it on the
-    first ``/`` to recover the space name and drops runs the caller cannot see. A
-    run with neither namespace nor owner therefore fails closed, which is the
-    intended behaviour for a row whose provenance is unknown.
+    first ``/`` to recover the space name and drops runs the caller cannot see. A run
+    with neither namespace nor owner therefore fails closed, which is the intended
+    behaviour for a row whose provenance is unknown.
     """
-    metadata = row.metadata or {}
+    job = job_detail(row.attributes)
     node_metadata = {
-        key: metadata[key] for key in _RUN_METADATA_KEYS if key in metadata
+        handler_key: job[job_key]
+        for job_key, handler_key in _RUN_METADATA_FROM_JOB.items()
+        if job.get(job_key)
     }
 
     # Identity of the execution, for a client correlating back to the index.
     node_metadata.setdefault("job_id", row.job_id)
-    if row.build_id:
-        node_metadata.setdefault("gb_build_id", row.build_id)
-    if row.target_run_uuid:
-        node_metadata.setdefault("gb_target_run_uuid", row.target_run_uuid)
-    node_metadata.setdefault("source_system", row.source_system)
+
+    # The originating system's own ids, when it had any. Prefixed so a client cannot
+    # mistake them for the index's own identity, which is the URI.
+    build_id = origin_id(row.attributes, "build_id")
+    if build_id:
+        node_metadata.setdefault("gb_build_id", build_id)
+        # The handler surfaces this as release_id, which IS the build id -- the two
+        # were separate fields holding one value before.
+        node_metadata.setdefault("release_id", build_id)
+    target_run_uuid = origin_id(row.attributes, "target_run_uuid")
+    if target_run_uuid:
+        node_metadata.setdefault("gb_target_run_uuid", target_run_uuid)
+
+    node_metadata.setdefault("source_system", origin_system(row.attributes))
 
     return {
         "id": run_id,
         "node_type": NODE_TYPE_RUN,
-        "name": metadata.get("job_name") or row.job_id,
+        "name": job.get("name") or row.job_id,
         "artifact_type": None,
         "is_root": False,
         "metadata": node_metadata,

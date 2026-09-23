@@ -118,7 +118,6 @@ def walk_lineage(
     direction: Direction = Direction.BOTH,
     max_depth: int = DEFAULT_MAX_DEPTH,
     max_nodes_per_level: int = DEFAULT_MAX_NODES_PER_LEVEL,
-    build_id: Optional[str] = None,
 ) -> LineageGraph:
     """Walk the lineage graph outward from ``seeds``.
 
@@ -131,8 +130,6 @@ def walk_lineage(
         max_depth: how many levels to expand. 0 returns an empty graph.
         max_nodes_per_level: ceiling on one level's frontier; exceeding it marks
             the result truncated.
-        build_id: when given, only rows of that build are followed, so a walk can
-            stay inside one build's graph instead of crossing into others.
 
     Returns:
         The reachable subgraph. An artifact with no lineage yields an empty graph
@@ -157,7 +154,6 @@ def walk_lineage(
             direction=one_way,
             max_depth=max_depth,
             max_nodes_per_level=max_nodes_per_level,
-            build_id=build_id,
             graph=graph,
             seen_rows=seen_rows,
         )
@@ -170,7 +166,6 @@ def _walk_one_direction(
     direction: Direction,
     max_depth: int,
     max_nodes_per_level: int,
-    build_id: Optional[str],
     graph: LineageGraph,
     seen_rows: set,
 ) -> None:
@@ -199,8 +194,6 @@ def _walk_one_direction(
             return
 
         rows = _hop(storage, frontier, direction)
-        if build_id is not None:
-            rows = [r for r in rows if r.build_id == build_id]
 
         next_frontier: list = []
         for row in rows:
