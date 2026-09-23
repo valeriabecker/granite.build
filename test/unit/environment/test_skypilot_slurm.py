@@ -7,6 +7,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Shared launch-mock scaffolding (also used by test_skypilot_sbatch_options.py);
+# kept in libgbtest so it doesn't drift across the SkyPilot test files.
+from libgbtest.environments.skypilot_mocks import (
+    _launch_and_get_resources,
+    _make_env,
+    _mock_sky,
+)
+
 from gbserver.environment.skypilot import (
     Skypilot,
     _is_interactive_auth_stdin_failure,
@@ -37,15 +45,6 @@ def slurm_env():
         },
     )
     return Skypilot(event_q=event_q, environment_config=config)
-
-
-def _mock_sky():
-    mock = MagicMock()
-    mock.Resources = MagicMock(return_value=MagicMock())
-    mock.Task = MagicMock(return_value=MagicMock())
-    mock.launch = MagicMock(return_value="req-slurm")
-    mock.stream_and_get = MagicMock(return_value=(1, MagicMock()))
-    return mock
 
 
 class TestSlurmInfraPath:
@@ -198,39 +197,6 @@ class TestSlurmInfraPath:
 
         call_kwargs = mock_sky.Resources.call_args[1]
         assert call_kwargs["infra"] == "slurm"
-
-
-def _make_env(config: dict) -> Skypilot:
-    """Build a Skypilot environment from a raw env-config dict.
-
-    :param config: the EnvironmentConfig.config payload (default_cloud,
-        cluster, zone, etc.).
-    :returns: a Skypilot instance wired to a fresh event queue.
-    """
-    return Skypilot(
-        event_q=asyncio.Queue(),
-        environment_config=EnvironmentConfig(
-            name="test-slurm", type="Skypilot", config=config
-        ),
-    )
-
-
-async def _launch_and_get_resources(env: Skypilot, launch_id: str, **launch_kwargs):
-    """Launch under mocked sky and return the sky.Resources call kwargs.
-
-    :param env: the Skypilot environment under test.
-    :param launch_id: unique id for this launch (arms the ready event).
-    :param launch_kwargs: forwarded to launch_skypilot (launcher_config, config).
-    :returns: the kwargs dict passed to the mocked sky.Resources constructor.
-    """
-    mock_sky = _mock_sky()
-    with (
-        patch("gbserver.environment.skypilot.sky", mock_sky),
-        patch("gbserver.environment.skypilot.HAS_SKYPILOT", True),
-    ):
-        env._get_launch_ready_event(launch_id)
-        await env.launch_skypilot(launch_id=launch_id, **launch_kwargs)
-    return mock_sky.Resources.call_args[1]
 
 
 class TestSlurmEnvConfigPartition:
