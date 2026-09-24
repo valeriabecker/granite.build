@@ -31,8 +31,6 @@ from gbserver.lineage.openlineage_models import (
     ArtifactGraphRequest,
     ArtifactGraphResponse,
     ArtifactRunEntry,
-    BuildGraphRequest,
-    BuildGraphResponse,
 )
 from gbserver.lineage.openlineage_models import LineageEvent as OpenLineageEvent
 from gbserver.lineage.uri_normalize import display_uri_from_url
@@ -446,92 +444,12 @@ def get_artifact_graph(request: Request, body: ArtifactGraphRequest):
     )
 
 
-@lineage_api.post("/build")
-def get_build_graph(request: Request, body: BuildGraphRequest) -> BuildGraphResponse:
-    """Return the lineage graph seeded from every artifact a build touched.
-
-    A build is not a graph node, and it is not a column in the lineage index
-    either: a build is a granite.build process concept, absent from every imported
-    row. It is resolved outside the index -- the build's target runs name their
-    artifacts, those artifacts' URIs become the seed set, and the walk is the
-    ordinary one from there.
-
-    Authorization is on the seed build, the same check ``get_build_jobstats``
-    applies.
-
-    Authorization is on the **seed build only**, the same check
-    ``get_build_jobstats`` applies. The walk then follows edges out of this build into
-    artifacts produced by others, and those are deliberately not re-authorized: see
-    :func:`query_lineage_graph` for why a lineage graph is cross-space by design and
-    what that costs. ``within_build_only`` used to bound the walk instead; it filtered
-    on a ``build_id`` column the index no longer has, and a scoped walk is now
-    expressed by choosing seeds.
-
-    Only the database-backed lineage service can answer this: a build is a
-    granite.build concept that the external backends have no notion of, so the
-    method is not on the ``LineageService`` interface and this endpoint reports
-    501 rather than inventing an empty answer.
-    """
-    if body.direction not in ("downstream", "upstream", "both"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="direction must be 'downstream', 'upstream', or 'both'",
-        )
-
-    storage = get_admin_storage()
-    build = storage.build_storage.get_by_uuid(body.build_id)
-    if build is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Build with id {body.build_id} not found",
-        )
-    assert isinstance(build, StoredBuild)
-    authorize_build_read_access(request, build)
-
-    # Deferred: importing the DB service at module scope would pull the storage
-    # layer into every environment that serves lineage from an external backend.
-    # pylint: disable=import-outside-toplevel
-    from gbserver.lineage.db_service import DBLineageService
-
-    service = _get_openlineage_service()
-    if not isinstance(service, DBLineageService):
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail=(
-                "Build-seeded lineage requires the database lineage provider; "
-                f"the configured provider is {type(service).__name__}."
-            ),
-        )
-
-    try:
-        result = service.get_build_graph(
-            build_id=body.build_id,
-            direction=body.direction,
-            max_depth=body.max_depth,
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
-
-    # A build with no lineage rows is not an error: it ran nothing that produced
-    # or consumed an artifact. An empty graph says so, and reads the same as the
-    # artifact path's "nothing recorded is a real answer".
-    if result is None:
-        return BuildGraphResponse(root_id=body.build_id)
-
-    return BuildGraphResponse(
-        root_id=result.get("root_id", body.build_id),
-        nodes=result.get("nodes", []),
-        edges=result.get("edges", []),
-        truncated=result.get("truncated", False),
-    )
-
-# The only routes in this file taking query params. A GET with filters is what a UI
+# The only route in this file taking query params. A GET with filters is what a UI
 # wants for a shareable, bookmarkable lineage view, and every filter here maps to an
 # indexed text column, so there is no shape a caller can ask for that forces a scan.
-@lineage_api.get("/graph")
+# There is no POST form: the filters are a handful of scalars, so a body would carry
+# nothing a query string cannot, at the cost of an unbookmarkable URL.
+@lineage_api.get("/graph", tags=["db-backed"])
 def query_lineage_graph_get(
     request: Request,
     uri: Optional[str] = None,
@@ -541,7 +459,7 @@ def query_lineage_graph_get(
 ) -> LineageGraphResponse:
     """Query the lineage graph by URI, by job, or with no filter at all.
 
-    The GET form of :func:`query_lineage_graph`; see it for the semantics.
+    The HTTP surface for :func:`query_lineage_graph`; see it for the semantics.
     """
     return query_lineage_graph(
         request,
@@ -551,7 +469,6 @@ def query_lineage_graph_get(
     )
 
 
-@lineage_api.post("/graph")
 def query_lineage_graph(
     request: Request, body: LineageQueryRequest
 ) -> LineageGraphResponse:
@@ -641,7 +558,7 @@ def query_lineage_graph(
     )
 
 
-@lineage_api.get("/runs")
+@lineage_api.get("/runs", tags=["db-backed"])
 def list_lineage_runs(
     request: Request,
     uri: Optional[str] = None,

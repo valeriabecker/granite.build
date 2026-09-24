@@ -343,45 +343,6 @@ class TestChainAcrossBuilds:
             normalize_uri(final.uri),
         }
 
-    def test_a_build_seeded_graph_follows_the_chain_out_of_its_build(self, storage):
-        """Scope is now chosen by seeds, not by a row filter.
-
-        ``within_build_only`` filtered on a ``build_id`` column the index no longer
-        has. A build's own artifacts are the seeds; the walk follows the chain from
-        there, which is the point of a cross-build index.
-        """
-        build1 = add_build(storage)
-        raw = add_table(storage, "raw_tbl")
-        t1_uuid = str(uuid_module.uuid4())
-        mid = add_model(storage, build1, t1_uuid, "mid")
-        add_target(
-            storage, build1, inputs={"raw": raw.uuid}, outputs={"mid": [mid.uuid]}
-        )
-
-        build2 = add_build(storage)
-        t2_uuid = str(uuid_module.uuid4())
-        final = add_model(storage, build2, t2_uuid, "final")
-        add_target(
-            storage, build2, inputs={"mid": mid.uuid}, outputs={"final": [final.uuid]}
-        )
-
-        sink = DBLineageStore(storage=storage.lineage_row_storage)
-        sink.add_jobstats_for_build(storage, build1.uuid)
-        sink.add_jobstats_for_build(storage, build2.uuid)
-
-        service = DBLineageService(
-            storage=storage.lineage_row_storage, admin_storage=storage
-        )
-        crossing = service.get_build_graph(build1.uuid, direction="downstream")
-        assert normalize_uri(final.uri) in artifact_ids(crossing)
-
-        # And a caller wanting only build1's own artifacts asks about those, rather
-        # than asking the index to filter on a concept it does not model.
-        own = service.get_artifact_graph(
-            artifact_url=raw.uri, direction="downstream", max_depth=1
-        )
-        assert normalize_uri(final.uri) not in artifact_ids(own)
-
 
 class TestErrors:
     def test_an_unknown_build_raises(self, storage):

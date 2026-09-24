@@ -89,19 +89,13 @@ class DBLineageService(LineageService):
         storage: the lineage row storage to read. Defaults to the process-wide
             admin storage, resolved lazily so importing this module does not
             require a configured database.
-        admin_storage: the admin storage used to resolve a *build* into the
-            artifacts it touched. Only the build-seeded path needs it -- the index
-            itself has no notion of a build -- so it is separate from ``storage``
-            and likewise resolved lazily.
     """
 
     def __init__(
         self,
         storage: Optional[ILineageRowStorage] = None,
-        admin_storage: Optional[object] = None,
     ) -> None:
         self._storage = storage
-        self._admin = admin_storage
 
     @property
     def storage(self) -> ILineageRowStorage:
@@ -444,117 +438,6 @@ class DBLineageService(LineageService):
             logger.exception("Could not read recent lineage activity")
         return set()
 
-    def get_build_graph(
-        self,
-        build_id: str,
-        direction: str = "both",
-        max_depth: int = 10,
-    ) -> Optional[Dict]:
-        """Return the lineage graph seeded from every artifact a build touched.
-
-        A build is not a node in this index, and it is not a column either: a build
-        is granite.build's own process concept, absent from every imported row, so
-        indexing it would index blanks over most of the table. It is resolved
-        *outside* the index instead -- the build's target runs name their input and
-        output artifacts, those artifacts have URIs, and those URIs seed the ordinary
-        walk. One extra query buys an index that stays portable to a source with
-        pipelines, DAG runs, or no such concept at all.
-
-        Args:
-            build_id: the build to seed from.
-            direction: ``downstream``, ``upstream`` or ``both``, in wire terms.
-            max_depth: how many hops to expand beyond the seeds.
-
-        Returns:
-            ``{root_id, nodes, edges, truncated}`` with ``root_id`` set to
-            ``build_id``, or ``None`` when the build touched no resolvable artifact.
-            ``root_id`` names no artifact node here, so nothing is flagged
-            ``is_root``: a build's graph has several roots, and picking one
-            arbitrarily would misreport which artifact was asked about.
-
-        Raises:
-            ValueError: if ``direction`` is not a wire direction.
-        """
-        walk_direction = _WIRE_DIRECTIONS.get(direction)
-        if walk_direction is None:
-            raise ValueError(
-                f"direction must be one of {sorted(_WIRE_DIRECTIONS)}, got {direction!r}"
-            )
-        if not build_id:
-            return None
-
-        seeds = self._build_seed_uris(build_id)
-        if not seeds:
-            return None
-
-        graph = walk_lineage(
-            storage=self.storage,
-            seeds=seeds,
-            direction=walk_direction,
-            max_depth=max_depth,
-            max_nodes_per_level=DEFAULT_MAX_NODES_PER_LEVEL,
-        )
-        return build_graph_dict(graph, root_uri=build_id, root_is_artifact=False)
-
-    def _build_seed_uris(self, build_id: str) -> set:
-        """Normalized URIs of every artifact a build's target runs touched.
-
-        Reads granite.build's own tables, not the lineage index: this is the seam
-        that keeps the index generic, resolving the build concept here so it never
-        reaches the schema.
-
-        It derives the endpoints through the **shared event builder**, the same one
-        the write sink and ``GET /lineage/build/{id}`` use, rather than walking
-        ``input_artifacts``/``output_artifacts`` and resolving uuids itself. Those
-        would be two pieces of code answering one question -- "which artifacts did
-        this build touch" -- free to disagree about an artifact-less target or an
-        unresolvable uuid. Going through the builder means a build's seeds are by
-        construction the endpoints its lineage rows were written from, so a graph
-        cannot be seeded from a set the writer never saw.
-
-        An endpoint whose URI does not normalize is skipped rather than guessed. A
-        missing seed costs part of a graph; an invented one invents provenance.
-        """
-        try:
-            storage = self._admin_storage()
-            targets = storage.target_storage.get_by_where({"build_id": build_id})
-        except Exception:
-            logger.exception("Could not read target runs for build %s", build_id)
-            return set()
-        if not targets:
-            return set()
-
-        from gbserver.lineage.db_jobstats import DBLineageStore
-
-        builder = DBLineageStore(storage=self.storage)
-        seeds: set = set()
-        for target in targets:
-            try:
-                events, _ = builder.create_jobstats_for_target(storage, target)
-            except Exception:
-                # One unbuildable target must not cost the whole graph; the others
-                # still seed it.
-                logger.debug(
-                    "Could not build events for target %s",
-                    getattr(target, "uuid", "?"),
-                )
-                continue
-            for event in events:
-                seeds.update(_event_endpoint_uris(event))
-        return seeds
-
-    def _admin_storage(self):
-        """The admin storage used to resolve a build, resolved on first use.
-
-        Imported inside the function so importing this module does not require a
-        configured database.
-        """
-        if self._admin is None:
-            from gbserver.storage.singleton_storage import get_admin_storage
-
-            self._admin = get_admin_storage()
-        return self._admin
-
     # -- Write-path methods. This service reads an index that another writer
     # populates, so none of these apply; each returns the value that makes a caller
     # behave correctly rather than one that merely avoids an exception.
@@ -605,24 +488,6 @@ class DBLineageService(LineageService):
         id here versus target run uuid there -- and the two would disagree.
         """
         return target_ids
-
-
-def _event_endpoint_uris(event: dict) -> set:
-    """Normalized URIs of an event's source and target artifacts.
-
-    Reuses ``decompose``'s URI accessor so the seeds are read from an artifact dict
-    exactly as the writer reads them -- including its three-key fallback, since
-    producers disagree on whether the URI sits at the top level or in the facets.
-    """
-    from gbserver.lineage.decompose import _artifact_uri, _normalized_job_keys
-
-    uris: set = set()
-    for key in _normalized_job_keys():
-        for artifact in event.get(key) or []:
-            uri = normalize_uri(_artifact_uri(artifact))
-            if uri:
-                uris.add(uri)
-    return uris
 
 
 def _run_entry(row) -> Dict:

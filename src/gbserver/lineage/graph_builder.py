@@ -41,6 +41,7 @@ into one shared "nothing" node.
 import logging
 from typing import Optional
 
+from gbcommon.uri.lh import URLSEGMENT_FILES, URLSEGMENT_MODELS as LH_URLSEGMENT_MODELS
 from gbserver.lineage.attributes import (
     SOURCE,
     TARGET,
@@ -248,15 +249,24 @@ def _name_from_uri(uri: str) -> str:
     """A display name for a URI whose row carried none.
 
     The last non-empty path segment, which is the artifact's own name in every
-    scheme this index stores (a model label, a table name, an object key). Falls
-    back to the whole URI rather than to an empty label: a node with no name is
-    worse to look at than a long one.
+    scheme this index stores (a model label, a table name, an object key) --
+    except an ``lh://`` model or fileset, whose last segment is a revision or
+    version, not a name (see ``uri_normalize._normalize_lh``); there the name is
+    the segment before it. Falls back to the whole URI rather than to an empty
+    label: a node with no name is worse to look at than a long one.
     """
     if not uri:
         return ""
     without_scheme = uri.split("://", 1)[-1]
     segments = [segment for segment in without_scheme.split("/") if segment]
-    return segments[-1] if segments else uri
+    if not segments:
+        return uri
+    if uri.startswith("lh://") and len(segments) >= 5 and segments[2] in (
+        LH_URLSEGMENT_MODELS,
+        URLSEGMENT_FILES,
+    ):
+        return segments[-2]
+    return segments[-1]
 
 
 def _self_loop_node_id(uri: str) -> str:
