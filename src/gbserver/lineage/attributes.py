@@ -279,6 +279,7 @@ def build_index_attributes(
     job_status: str = "",
     job_started_at: str = "",
     job_completed_at: str = "",
+    submitted_by: str = "",
     tags: Optional[Dict[str, str]] = None,
     input_uri: str = "",
     input_artifact: Optional[Dict[str, Any]] = None,
@@ -325,6 +326,8 @@ def build_index_attributes(
         JOB_STATUS: job_status,
         JOB_STARTED_AT: job_started_at,
         JOB_COMPLETED_AT: job_completed_at,
+        # Who posted the event (POST /lineage/); the takeover check reads it.
+        JOB_SUBMITTED_BY: submitted_by,
     }
     job = {key: str(value) for key, value in job.items() if value}
     if tags:

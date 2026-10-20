@@ -381,6 +381,7 @@ def row_from_draft(
             job_status=str(metadata.get("job_status") or ""),
             job_started_at=str(metadata.get("job_started_at") or ""),
             job_completed_at=str(metadata.get("job_completed_at") or ""),
+            submitted_by=str(metadata.get("submitted_by") or ""),
             input_uri=draft.input or "",
             input_artifact=draft.input_artifact,
             output_uri=draft.output or "",

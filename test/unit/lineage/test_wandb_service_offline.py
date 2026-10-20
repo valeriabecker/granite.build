@@ -133,3 +133,31 @@ def test_online_registers_artifacts():
     register.assert_called_once()
     # The run is passed through to artifact registration.
     assert register.call_args.args[0] is run
+
+
+def test_the_tags_facet_cannot_override_the_checked_fields():
+    """POST /lineage/ checks job_namespace, owner, job_id and submitted_by; a
+    ``tags`` facet naming them must not replace them in the run config."""
+    service = _service()
+    run = _make_run(offline=True)
+    event = _event()
+    event["job"]["namespace"] = "ext/x"
+    event["run"]["facets"] = {
+        "job_details": {"job_id": "MINE", "owner": "alice", "submitted_by": "alice"},
+        "tags": {
+            "job_namespace": "victim/b",
+            "owner": "bob",
+            "job_id": "THEIRS",
+            "submitted_by": "bob",
+            "team": "ml",
+        },
+    }
+    with patch.object(service, "_get_run", return_value=run):
+        service.emit_event(event)
+    (config,), _ = run.config.update.call_args
+    assert config["job_namespace"] == "ext/x"
+    assert config["owner"] == "alice"
+    assert config["job_id"] == "MINE"
+    assert config["submitted_by"] == "alice"
+    assert config["team"] == "ml"
+    assert not any(t.startswith(("owner=", "job_namespace=")) for t in run.tags)

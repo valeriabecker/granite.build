@@ -48,6 +48,12 @@ logger = get_logger(__name__)
 LINEAGE_RUN_JOB_TYPE = "gb-lineage-event"
 
 _PASSTHROUGH_FACET_KEYS = ("job_input_params", "execution_stats")
+# Keys the access checks and the read side's attribution read; set from the event's
+# job and job_details only, never from the free-form ``tags`` facet, which would
+# otherwise override them after POST /lineage/ checked the real ones.
+_RESERVED_CONFIG_KEYS = frozenset(
+    {"job_name", "job_namespace", "job_id", "owner", "submitted_by", "event_type"}
+)
 _JOB_DETAIL_KEYS = (
     "job_id",
     "job_type",
@@ -269,7 +275,7 @@ class WandBLineageService(LineageService):
 
             tags = run_facets.get("tags", {})
             for key, value in tags.items():
-                if not key.startswith("_"):
+                if not key.startswith("_") and key not in _RESERVED_CONFIG_KEYS:
                     config_update[key] = value
 
             source_code = run_facets.get("source_code", {})
@@ -296,7 +302,9 @@ class WandBLineageService(LineageService):
             if "tags" in run_facets:
                 tags_dict = run_facets["tags"]
                 tags_list = [
-                    f"{k}={v}" for k, v in tags_dict.items() if not k.startswith("_")
+                    f"{k}={v}"
+                    for k, v in tags_dict.items()
+                    if not k.startswith("_") and k not in _RESERVED_CONFIG_KEYS
                 ]
                 if tags_list:
                     run.tags = list(run.tags) + tags_list

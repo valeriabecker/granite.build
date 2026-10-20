@@ -396,3 +396,21 @@ def test_submitted_by_reaches_the_rows_job_group():
     assert "submitted_by" in JOB_METADATA_KEYS
     blob = build_attributes(job_metadata={"submitted_by": "alice"})
     assert blob["job"]["submitted_by"] == "alice"
+
+
+def test_submitted_by_reaches_the_index_row_written_from_a_job():
+    """End to end through the index writer, not a hand-built row: the takeover
+    check refused a submitter's second event because the real rows had no
+    submitter."""
+    from gbserver.lineage.row_indexing import row_from_draft
+
+    (draft,) = to_lineage_rows(
+        {
+            "job_id": "EXT-1",
+            "submitted_by": "alice",
+            "sources": [{"uri": "s3://b/a"}],
+            "targets": [{"uri": "s3://b/b"}],
+        }
+    )
+    row = row_from_draft(draft, build_id="", target_run_uuid="", job_store="wandb")
+    assert row.attributes["job"]["submitted_by"] == "alice"
