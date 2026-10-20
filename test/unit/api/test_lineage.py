@@ -748,6 +748,33 @@ def test_jobs_lists_by_tag_alone():
     assert seen["uri"] is None
 
 
+@pytest.mark.parametrize(
+    "tags, extra",
+    [
+        # Confirms a job's owner: job_id=X&tag=username=bob.
+        (["username=bob"], {"job_id": "X"}),
+        # Lists every job of a space the caller cannot read.
+        (["space_name=S"], {}),
+        (["team=nlp", "build_id=B"], {}),
+        # A bare identity key is refused too.
+        (["owner"], {}),
+    ],
+    ids=["owner_probe", "space_listing", "mixed", "bare"],
+)
+def test_jobs_refuses_a_tag_on_an_identity_key(tags, extra):
+    service = _db_service(list_jobs=lambda **_kw: AssertionError("not reached"))
+    with patch.object(lineage_mod, "_get_index_service", return_value=service):
+        with pytest.raises(HTTPException) as exc:
+            lineage_mod.list_lineage_jobs(
+                _fake_request("member", "member@example.com"),
+                tag=tags,
+                limit=100,
+                offset=0,
+                **extra,
+            )
+    assert exc.value.status_code == 422
+
+
 def test_jobs_with_only_empty_tags_is_still_a_422():
     with pytest.raises(HTTPException) as exc:
         lineage_mod.list_lineage_jobs(

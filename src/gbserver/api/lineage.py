@@ -512,6 +512,23 @@ def query_lineage_graph(
     )
 
 
+# Tag keys the producers write to say who ran a job and where (see
+# wandb_jobstats' tags facet), plus the fields the access check reads. The job
+# listing withholds them, so the tag filter must not match on them either.
+_IDENTITY_TAG_KEYS = frozenset(
+    {
+        "username",
+        "space_name",
+        "build_id",
+        "target_id",
+        "owner",
+        "job_namespace",
+        "job_id",
+        "submitted_by",
+    }
+)
+
+
 @lineage_api.get("/jobs", tags=["lineage-index"])
 def list_lineage_jobs(
     request: Request,
@@ -545,7 +562,10 @@ def list_lineage_jobs(
       no recorded input; ``output``: only those that read it with no recorded
       output. The runs behind a grouped node with one empty side.
     - ``tag`` (optional, repeated) -- only the jobs carrying every given tag, ``k=v``
-      or a bare ``k`` (which matches only a bare tag, not any value of ``k``).
+      or a bare ``k`` (which matches only a bare tag, not any value of ``k``). User
+      labels only: identity keys (``username``, ``space_name``, ``build_id``, ...;
+      see ``_IDENTITY_TAG_KEYS``) are refused with 422, since matching on them
+      would reveal a job's owner or list a space the caller cannot read.
       Combines with every filter above, or stands alone. It is matched on the
       index rows, so it covers every lineage source, not only granite.build's
       jobs. Alone it scans the index: nothing indexes the tags. The entries still
@@ -571,6 +591,14 @@ def list_lineage_jobs(
     lineage answer is not filtered per space, and what that costs.
     """
     tags = [t for t in tag or [] if t]
+    identity = sorted({t.partition("=")[0] for t in tags} & _IDENTITY_TAG_KEYS)
+    if identity:
+        # These say who ran a job and in which space -- what the entries withhold.
+        # Matching on them would answer "is X bob's?" or list a space's jobs.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"tag cannot filter on identity keys: {', '.join(identity)}",
+        )
     if not uri and not job_id and not job_ids and not tags:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
