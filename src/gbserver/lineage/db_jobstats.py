@@ -32,6 +32,7 @@ count to detect. The reconciler's ``expected_counts`` is therefore accepted and
 ignored.
 """
 
+import copy
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -44,6 +45,7 @@ from gbserver.lineage.jobstats import ILineageStore
 from gbserver.lineage.merge import REJECTED, upsert_job
 from gbserver.storage.artifact_registration import ArtifactRegistration
 from gbserver.storage.lineage_job_storage import ILineageJobStorage
+from gbserver.storage.lineage_row_storage import ILineageRowStorage
 from gbserver.storage.singleton_storage import SingletonAdminStorage
 from gbserver.storage.stored_build import StoredBuild
 from gbserver.storage.stored_lineage_job import StoredLineageJob
@@ -178,12 +180,13 @@ class DBLineageStore(ILineageStore):
     ) -> None:
         """Record lineage for a registered artifact and the sources it came from.
 
-        This path has no target run, so the rows carry an empty
-        ``target_run_uuid``; ``build_id`` holds the artifact's uuid instead, which
-        is what the W&B sink also does -- its own comment says the "release_id" for
-        a registered artifact *is* the artifact uuid, and that is the column
-        :meth:`count_release_ids` queries. The ``(job_id, input, output)`` unique
-        still protects against duplicates, so having no target run costs nothing.
+        This path has no build and no target run, so ``build_id`` and
+        ``target_run_uuid`` are empty and the artifact's uuid is stored under
+        ``artifact_id`` -- the registration's release id, which
+        :meth:`count_release_ids` matches. Records written before #583 held it in
+        ``build_id``; :func:`migrate_registration_build_ids` moves them. The
+        ``(job_id, input, output)`` unique still protects against duplicates, so
+        having no target run costs nothing.
 
         One consequence worth knowing: these rows are never skipped by the
         presence-based dedup, which keys on ``target_run_uuid``. They do not need
@@ -193,10 +196,7 @@ class DBLineageStore(ILineageStore):
         job = self.create_jobstats_for_original_artifact(artifact, sources)
         if not job:
             return
-        # build_id carries the artifact uuid so count_release_ids(artifact.uuid)
-        # finds these rows -- the same convention the W&B sink uses, where a
-        # registered artifact's "release_id" IS its uuid.
-        self._write_job(job, build_id=artifact.uuid, target_run_uuid="")
+        self._write_job(job, build_id="", target_run_uuid="", artifact_id=artifact.uuid)
 
     def _record_target(
         self,
@@ -282,6 +282,7 @@ class DBLineageStore(ILineageStore):
         target_run_uuid: str,
         extra_tags: Optional[List[str]] = None,
         job_store: JobStore = JobStore.TARGETS,
+        artifact_id: str = "",
     ) -> None:
         """Record one job entry into ``gb_lineage_job``; see :meth:`_write_events`.
 
@@ -294,6 +295,7 @@ class DBLineageStore(ILineageStore):
             build_id=build_id,
             target_run_uuid=target_run_uuid,
             extra_tags=extra_tags,
+            artifact_id=artifact_id,
         )
 
     def _write_events(
@@ -302,6 +304,7 @@ class DBLineageStore(ILineageStore):
         build_id: str,
         target_run_uuid: str,
         extra_tags: Optional[List[str]] = None,
+        artifact_id: str = "",
     ) -> None:
         """Record the job entries of one execution as one ``gb_lineage_job`` write.
 
@@ -343,10 +346,12 @@ class DBLineageStore(ILineageStore):
             _normalized_job(events[0]),
             build_id=build_id,
             target_run_uuid=target_run_uuid,
+            artifact_id=artifact_id,
             entry={
                 "events": list(events),
                 "build_id": build_id,
                 "target_run_uuid": target_run_uuid,
+                "artifact_id": artifact_id,
                 "extra_tags": list(extra_tags or []),
             },
             tags=sorted(tags),
@@ -359,6 +364,7 @@ class DBLineageStore(ILineageStore):
         target_run_uuid: str,
         entry: Optional[dict] = None,
         tags: Optional[List[str]] = None,
+        artifact_id: str = "",
     ) -> None:
         """Store one job record, merging into one another writer already stored.
 
@@ -400,6 +406,7 @@ class DBLineageStore(ILineageStore):
             job_metadata,
             build_id=build_id,
             target_run_uuid=target_run_uuid,
+            artifact_id=artifact_id,
         )
         if not job:
             return
@@ -482,7 +489,11 @@ class DBLineageStore(ILineageStore):
 
         ``release_id`` is a ``build_id`` for build lineage and the artifact's uuid
         for a registered artifact -- W&B's convention, kept so the same argument
-        works against either sink.
+        works against either sink. A registration's uuid is matched under
+        ``origin.ids.artifact_id``, and also under ``build_id`` as a guard for
+        records written before #583 that :func:`migrate_registration_build_ids`
+        has not moved yet. Build and artifact uuids never collide, so matching
+        either id cannot count the other kind of release.
 
         Counted against ``gb_lineage_job``, this store's only source. Neither id
         is a column there -- both live in the ``attributes`` blob under
@@ -509,7 +520,10 @@ class DBLineageStore(ILineageStore):
         matched = 0
         for page in self.job_storage.get_paged():
             for job in page:
-                if origin_id(job.attributes, "build_id") != release_id:
+                if release_id not in (
+                    origin_id(job.attributes, "build_id"),
+                    origin_id(job.attributes, "artifact_id"),
+                ):
                     continue
                 if target_id and (
                     origin_id(job.attributes, "target_run_uuid") != target_id
@@ -776,6 +790,7 @@ def _job_from_metadata(
     build_id: str,
     target_run_uuid: str,
     source_system: str = SOURCE_SYSTEM,
+    artifact_id: str = "",
 ) -> Optional[StoredLineageJob]:
     """Turn a normalized job dict into the stored job record.
 
@@ -812,6 +827,187 @@ def _job_from_metadata(
         attributes=build_job_attributes(
             job_metadata=job_metadata,
             source_system=source_system,
-            ids={"build_id": build_id, "target_run_uuid": target_run_uuid},
+            ids={
+                "build_id": build_id,
+                "target_run_uuid": target_run_uuid,
+                "artifact_id": artifact_id,
+            },
         ),
     )
+
+
+# -- Migration: registration uuids out of build_id (#583) --------------------
+
+
+def _legacy_registration_uuid(job: StoredLineageJob) -> str:
+    """The artifact uuid a pre-#583 registration record holds in ``build_id``.
+
+    A registration's job id *is* the artifact uuid, so a record is legacy exactly
+    when its ``origin.ids.build_id`` equals its own ``job_id`` and it has no target
+    run. A build's record can never match: its job id is a target run uuid while
+    its ``build_id`` is the build's. ``""`` when the record is not legacy.
+    """
+    build_id = origin_id(job.attributes, "build_id")
+    if not build_id or build_id != job.job_id:
+        return ""
+    if origin_id(job.attributes, "target_run_uuid"):
+        return ""
+    return build_id
+
+
+def _migrated_attributes(attributes: dict, uuid: str) -> dict:
+    """``attributes`` with ``uuid`` moved from every ``build_id`` to ``artifact_id``.
+
+    Covers the ids the read path and the indexer consume: ``origin.ids`` (what
+    :meth:`DBLineageStore.count_release_ids` matches), ``retrieve`` (read first by
+    :func:`origin_id`), the stored entry's own ids (what the indexer passes to the
+    rows), and the facet tags in the entry's events and the ``run`` group (which
+    become ``build_id=`` tags). Only a value equal to ``uuid`` is touched.
+    """
+    migrated = copy.deepcopy(attributes or {})
+
+    def move(ids: Optional[dict]) -> None:
+        if isinstance(ids, dict) and ids.get("build_id") == uuid:
+            del ids["build_id"]
+            ids["artifact_id"] = uuid
+
+    move((migrated.get("origin") or {}).get("ids"))
+    move(migrated.get("retrieve"))
+
+    entry = migrated.get(ENTRY_ATTRIBUTE)
+    if isinstance(entry, dict):
+        if entry.get("build_id") == uuid:
+            entry["build_id"] = ""
+            entry["artifact_id"] = uuid
+        for event in _entry_events(entry):
+            tags = ((event.get("run") or {}).get("facets") or {}).get("tags")
+            move(tags)
+
+    run_tags = (migrated.get("run") or {}).get("run_tags")
+    move(run_tags)
+    return migrated
+
+
+def _migrated_row_attributes(attributes: dict, job_id: str, uuid: str) -> dict:
+    """A legacy registration row's ``attributes`` as a fresh index would write them.
+
+    A row with no build and no target run is written with ``retrieve={"job_id"}``
+    (see ``row_from_draft``), and its ``build_id=`` tag is gone with the facet.
+    Re-indexing cannot get there on its own: the row merge fills blanks and keeps
+    what is stored, so the old ``build_id`` would survive. Only a value equal to
+    ``uuid`` is touched.
+    """
+    migrated = copy.deepcopy(attributes or {})
+    retrieve = migrated.get("retrieve")
+    if isinstance(retrieve, dict) and retrieve.get("build_id") == uuid:
+        migrated["retrieve"] = {"job_id": job_id}
+    tags = (migrated.get("job") or {}).get("tags")
+    if isinstance(tags, dict) and tags.get("build_id") == uuid:
+        del tags["build_id"]
+        tags["artifact_id"] = uuid
+    return migrated
+
+
+def migrate_registration_build_ids(
+    job_storage: ILineageJobStorage,
+    row_storage: Optional[ILineageRowStorage] = None,
+    dry_run: bool = False,
+) -> int:
+    """Move registration uuids out of ``build_id`` into ``artifact_id``.
+
+    Before #583 a registered artifact's record put the artifact uuid in
+    ``build_id``. This rewrites those records in place: the ids, the stored entry
+    and the ``build_id=<uuid>`` tag. With ``row_storage``, the job's index rows
+    are corrected too (see :func:`_migrated_row_attributes`); ``update_fields``
+    also stamps the record's ``recorded_at``, so the indexer re-reads it and the
+    rows it re-derives agree with the corrected ones.
+
+    Idempotent: a migrated record no longer matches, so a second run is a no-op.
+    Candidates are collected before any write, so moving ``recorded_at`` cannot
+    shift the pages being walked.
+
+    Returns:
+        How many job records plus index rows were (or, with ``dry_run``, would
+        be) migrated.
+    """
+    candidates: List[Tuple[str, str]] = []
+    for page in job_storage.get_paged():
+        for job in page:
+            uuid = _legacy_registration_uuid(job)
+            if uuid:
+                candidates.append((job.uuid, uuid))
+
+    if dry_run:
+        rows = 0
+        if row_storage is not None:
+            rows = sum(
+                1
+                for page in row_storage.get_paged()
+                for row in page
+                if _legacy_registration_row(row)
+            )
+        return len(candidates) + rows
+
+    migrated = 0
+    for record_uuid, artifact_uuid in candidates:
+        job = job_storage.get_by_uuid(record_uuid)
+        if not isinstance(job, StoredLineageJob):
+            continue
+        if _legacy_registration_uuid(job) != artifact_uuid:
+            continue  # changed since it was listed
+        tags = [t for t in (job.tags or []) if t != f"build_id={artifact_uuid}"]
+        tags.append(f"artifact_id={artifact_uuid}")
+        job_storage.update_fields(
+            record_uuid,
+            {
+                "attributes": _migrated_attributes(job.attributes, artifact_uuid),
+                "tags": sorted(set(tags)),
+            },
+        )
+        migrated += 1
+    if row_storage is not None:
+        migrated += _migrate_registration_rows(row_storage)
+    logger.info("Migrated %d registration lineage record(s) (#583)", migrated)
+    return migrated
+
+
+def _legacy_registration_row(row) -> bool:
+    """Whether an index row is a pre-#583 registration's, whatever its job store.
+
+    Its ``retrieve.build_id`` is its own ``job_id`` (the artifact uuid) with no
+    target run. A build's row never matches: its job id is a target run uuid.
+    """
+    retrieve = (row.attributes or {}).get("retrieve") or {}
+    return (
+        bool(retrieve.get("build_id"))
+        and retrieve.get("build_id") == row.job_id
+        and not retrieve.get("target_run_uuid")
+    )
+
+
+def _migrate_registration_rows(row_storage: ILineageRowStorage) -> int:
+    """Correct every legacy registration row in the index; how many were.
+
+    Covers rows indexed from W&B too: the runs there are not migrated, but their
+    rows live in this index, and the row merge would keep the old ``build_id``
+    on a re-index (see :func:`_migrated_row_attributes`).
+    """
+    legacy = [
+        row.uuid
+        for page in row_storage.get_paged()
+        for row in page
+        if _legacy_registration_row(row)
+    ]
+    for row_uuid in legacy:
+        row = row_storage.get_by_uuid(row_uuid)
+        if row is None or not _legacy_registration_row(row):
+            continue
+        row_storage.update_fields(
+            row_uuid,
+            {
+                "attributes": _migrated_row_attributes(
+                    row.attributes, row.job_id, row.job_id
+                )
+            },
+        )
+    return len(legacy)

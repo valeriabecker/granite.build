@@ -251,6 +251,7 @@ class LineageRowIndexer:
         job_store: JobStore = JobStore.TARGETS,
     ) -> None:
         """Decompose-and-store every draft of one job entry."""
+        job, build_id = _without_legacy_registration_build_id(job, build_id)
         # Tags ride on every row of the job, in ``attributes.job.tags``.
         tags = job_tags(
             job,
@@ -383,3 +384,33 @@ def row_from_draft(
             ),
         ),
     )
+
+
+def _without_legacy_registration_build_id(job: dict, build_id: str) -> tuple:
+    """Guard for registrations recorded before #583: drop their fake ``build_id``.
+
+    Those entries carried the artifact uuid as ``build_id`` -- in the W&B run's
+    tags and in a ``gb_lineage_job`` record's entry alike. Rows indexed from them
+    would point ``retrieve`` at a build that does not exist (job detail would
+    answer "build not found") and carry a ``build_id=<artifact uuid>`` tag.
+
+    A registration is recognized by its facet tags naming the same uuid as both
+    ``artifact_id`` and ``build_id``; a build's run tags have no ``artifact_id``,
+    so it is never touched. W&B runs are not migrated, so this is permanent;
+    ``gb_lineage_job`` records are also fixed at the source by
+    ``migrate_registration_build_ids``.
+
+    Returns:
+        ``(job, build_id)``: unchanged, or a copy without the facet ``build_id``
+        and ``""``, which is what a registration recorded today carries.
+    """
+    if not build_id:
+        return job, build_id
+    facet_tags = ((job.get("run") or {}).get("facets") or {}).get("tags")
+    if not isinstance(facet_tags, dict) or facet_tags.get("artifact_id") != build_id:
+        return job, build_id
+    run = dict(job["run"])
+    facets = dict(run["facets"])
+    facets["tags"] = {k: v for k, v in facet_tags.items() if k != "build_id"}
+    run["facets"] = facets
+    return {**job, "run": run}, ""

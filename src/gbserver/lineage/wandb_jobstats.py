@@ -542,11 +542,25 @@ class WandBLineageStore(ILineageStore):
         self, release_id: str, target_id: Optional[str] = None
     ) -> int:
         # One wandb run is created per (target, output artifact), so counting
-        # runs tagged with this build_id (and optionally target_id) directly
+        # runs tagged with this release id (and optionally target_id) directly
         # yields the number of jobstats records without scanning run history.
+        #
+        # A release id is a build uuid or, for a registration, the artifact uuid.
+        # Registrations are tagged ``artifact_id=``; runs written before #583 also
+        # carry the uuid under ``build_id=``, and W&B runs are not migrated. The
+        # filter is ``$in`` (OR) and counts each run once, so a legacy run tagged
+        # both ways is still one run, and since build and artifact uuids never
+        # collide neither tag can match the other kind of release.
+        #
+        # Runs with neither id (imports, runs from outside granite.build) must not
+        # be counted, so an empty release id answers 0 rather than querying the
+        # tags ``build_id=`` / ``artifact_id=``, as the db sink does.
+        if not release_id:
+            return 0
         required = [f"target_id={target_id}"] if target_id else None
         return self._service.count_runs_by_tags(
-            [f"build_id={release_id}"], required_tags=required
+            [f"build_id={release_id}", f"artifact_id={release_id}"],
+            required_tags=required,
         )
 
     def does_release_id_exist(
@@ -705,11 +719,11 @@ class WandBLineageStore(ILineageStore):
                 "runId": artifact.uuid,
                 "facets": {
                     "tags": {
+                        # A registration has no build: the artifact uuid is its
+                        # release id and lives under artifact_id only, which is
+                        # what count_release_ids also matches. Runs written before
+                        # #583 carry it under build_id too; see count_release_ids.
                         "artifact_id": artifact.uuid,
-                        # For registered-artifact jobstats the "release_id" is
-                        # the artifact uuid itself — tag build_id with that so
-                        # count_release_ids({artifact.uuid}) finds this run.
-                        "build_id": artifact.uuid,
                         "target_id": artifact.created_by_target_id,
                         "username": artifact.username,
                         "space_name": artifact.space_name,
