@@ -864,6 +864,22 @@ def _mock_space_access(request):
         yield
         return
 
+    from gbserver.spaces.space_access_manager import (
+        ISpaceAccessManager,
+        set_space_access_manager,
+    )
+
+    # Stub the manager seam too: modules that import is_super_admin by name
+    # (e.g. api.lineage) bypass the patches below and would otherwise reach
+    # StorageSpaceAccessManager, which under STAGING connects to a real SQL
+    # server and hangs. Admin/access default to True, matching the patches.
+    stub = MagicMock(spec=ISpaceAccessManager)
+    stub.is_space_admin.return_value = True
+    stub.has_space_access.return_value = True
+    stub.has_build_access.return_value = True
+    stub.get_user_spaces_with_access.return_value = []
+    set_space_access_manager(stub)
+
     with (
         patch(
             "gbserver.api.utils._has_existing_item_write_access",
@@ -886,7 +902,10 @@ def _mock_space_access(request):
             return_value=None,
         ),
     ):
-        yield
+        try:
+            yield
+        finally:
+            set_space_access_manager(None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
