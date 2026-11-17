@@ -10,7 +10,7 @@ indexed query, so a graph walk costs one query per level rather than a scan.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from gbserver.storage.storage import BaseItemStorage, IItemStorage
 from gbserver.storage.stored_lineage_row import TERMINAL, StoredLineageRow
@@ -73,6 +73,12 @@ def _keep_self_loops(
 
 class ILineageRowStorage(IItemStorage[StoredLineageRow]):
     """Interface for lineage row storage implementations."""
+
+    def get_paged(
+        self, where: Optional[Union[str, dict]] = None, page_size: int = 200
+    ) -> Iterator[List[StoredLineageRow]]:
+        """Yield pages of rows; see ``BaseItemStorage.get_paged``."""
+        raise NotImplementedError
 
     def get_rows_by_input(
         self, inputs: List[str], self_loops: bool = True, limit: Optional[int] = None

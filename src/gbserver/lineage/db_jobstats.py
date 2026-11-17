@@ -49,7 +49,7 @@ from gbserver.storage.lineage_row_storage import ILineageRowStorage
 from gbserver.storage.singleton_storage import SingletonAdminStorage
 from gbserver.storage.stored_build import StoredBuild
 from gbserver.storage.stored_lineage_job import StoredLineageJob
-from gbserver.storage.stored_lineage_row import JobStore
+from gbserver.storage.stored_lineage_row import JobStore, StoredLineageRow
 from gbserver.storage.stored_target_run import StoredTargetRun
 
 if TYPE_CHECKING:
@@ -950,9 +950,10 @@ def migrate_registration_build_ids(
 
     migrated = 0
     for record_uuid, artifact_uuid in candidates:
-        job = job_storage.get_by_uuid(record_uuid)
-        if not isinstance(job, StoredLineageJob):
+        found = job_storage.get_by_uuid(record_uuid)
+        if not isinstance(found, StoredLineageJob):
             continue
+        job = found
         if _legacy_registration_uuid(job) != artifact_uuid:
             continue  # changed since it was listed
         tags = [t for t in (job.tags or []) if t != f"build_id={artifact_uuid}"]
@@ -998,10 +999,11 @@ def _migrate_registration_rows(row_storage: ILineageRowStorage) -> int:
         for row in page
         if _legacy_registration_row(row)
     ]
+    migrated = 0
     for row_uuid in legacy:
         row = row_storage.get_by_uuid(row_uuid)
-        if row is None or not _legacy_registration_row(row):
-            continue
+        if not isinstance(row, StoredLineageRow) or not _legacy_registration_row(row):
+            continue  # gone or changed since it was listed
         row_storage.update_fields(
             row_uuid,
             {
@@ -1010,4 +1012,5 @@ def _migrate_registration_rows(row_storage: ILineageRowStorage) -> int:
                 )
             },
         )
-    return len(legacy)
+        migrated += 1
+    return migrated
